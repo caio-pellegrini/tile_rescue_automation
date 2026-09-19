@@ -1,0 +1,7 @@
+node_modules/
+.venv/
+*.log
+*.png
+*.jpg
+*.jpeg
+.DS_Store
