@@ -309,6 +309,110 @@ function boardAreaTiles(image, components = []) {
   return out.sort((a, b) => a.cy - b.cy || a.cx - b.cx);
 }
 
+function cardRectsOverlap(a, b) {
+  return Math.abs(a.cx - b.cx) < 120 && Math.abs(a.cy - b.cy) < 135;
+}
+
+function cardOverlapRatio(a, b) {
+  const overlapWidth = Math.max(0, 142 - Math.abs(a.cx - b.cx));
+  const overlapHeight = Math.max(0, 160 - Math.abs(a.cy - b.cy));
+  return (overlapWidth * overlapHeight) / (142 * 160);
+}
+
+function buildOcclusionGraph(image, available, tray) {
+  const trayTypes = [...new Set(tray.map(tile => tile.type))];
+  const references = new Map();
+  for (const tile of tray) {
+    if (!references.has(tile.type)) references.set(tile.type, tile.signature);
+  }
+
+  const hidden = [];
+  const edges = [];
+  for (const targetType of trayTypes) {
+    const reference = references.get(targetType);
+    if (!reference) continue;
+
+    for (const cover of available) {
+      const candidates = [];
+      // Search only the rectangle that could be hidden by this card. This is
+      // much less ambiguous than classifying every background pixel as a tile.
+      for (let cy = Math.max(BOARD_ROI.y0, cover.cy - 100); cy <= Math.min(BOARD_ROI.y1, cover.cy + 135); cy += 10) {
+        for (let cx = Math.max(BOARD_ROI.x0 + 48, cover.cx - 110); cx <= Math.min(BOARD_ROI.x1 - 48, cover.cx + 110); cx += 10) {
+          const distanceFromCover = Math.hypot(cx - cover.cx, cy - cover.cy);
+          if (distanceFromCover < 70) continue;
+          const signature = descriptor(image, cx, cy);
+          if (semanticType(signature) !== targetType) continue;
+          const visualDistance = distance(signature, reference);
+          if (visualDistance > 0.16) continue;
+          const hiddenTile = { cx, cy };
+          const overlap = cardOverlapRatio(cover, hiddenTile);
+          if (overlap < 0.25 || cy < cover.cy + 20) continue;
+          // Do not mistake the icon/card face of a neighboring exposed tile
+          // for a second hidden tile. A valid hidden candidate may overlap its
+          // cover, but not another independently playable card.
+          const overlapsAnotherAvailable = available.some(other =>
+            other !== cover && cardRectsOverlap(other, hiddenTile));
+          if (overlapsAnotherAvailable) continue;
+          candidates.push({ cx, cy, signature, visualDistance, overlap });
+        }
+      }
+
+      // Collapse the dense scan into one possible hidden card per region.
+      candidates.sort((a, b) => {
+        const scoreA = a.overlap * 0.7 + (1 - a.visualDistance) * 0.3;
+        const scoreB = b.overlap * 0.7 + (1 - b.visualDistance) * 0.3;
+        return scoreB - scoreA;
+      });
+      let candidate = null;
+      for (const item of candidates) {
+        if (!candidate || Math.hypot(item.cx - candidate.cx, item.cy - candidate.cy) >= 55) {
+          candidate = item;
+          break;
+        }
+      }
+      if (!candidate) continue;
+
+      const node = {
+        id: `hidden-${hidden.length}`,
+        type: targetType,
+        x: candidate.cx - 71,
+        y: candidate.cy - 80,
+        w: 142,
+        h: 160,
+        cx: candidate.cx,
+        cy: candidate.cy,
+        confidence: Number((1 - candidate.visualDistance).toFixed(3)),
+        overlap: Number(candidate.overlap.toFixed(3)),
+      };
+      hidden.push(node);
+      edges.push({
+        cover: { cx: cover.cx, cy: cover.cy, type: cover.type },
+        target: node,
+        relation: 'covers',
+      });
+    }
+  }
+
+  // The same partial card can be found from two neighboring cover cards.
+  const uniqueHidden = [];
+  const uniqueEdges = [];
+  for (const edge of edges) {
+    let node = uniqueHidden.find(item =>
+      item.type === edge.target.type && Math.hypot(item.cx - edge.target.cx, item.cy - edge.target.cy) < 55);
+    if (!node) {
+      node = edge.target;
+      uniqueHidden.push(node);
+    }
+    uniqueEdges.push({ ...edge, target: node });
+  }
+
+  return {
+    nodes: available.map(tile => ({ cx: tile.cx, cy: tile.cy, type: tile.type })),
+    hidden: uniqueHidden,
+    edges: uniqueEdges,
+  };
+}
+
 function dedupeTiles(tiles) {
   const out = [];
   for (const tile of tiles) {
@@ -331,6 +435,7 @@ function summarize(image, components, clusters) {
   // component as playable.
   const tray = tiles.filter(t => t.cy >= 1600 && t.cy <= 1900);
   const visible = tiles.filter(t => t.cy < BOARD_ROI.y1);
+  const occlusionGraph = buildOcclusionGraph(image, available, tray);
   const trayCounts = {};
   for (const t of tray) trayCounts[t.type] = (trayCounts[t.type] || 0) + 1;
   const visibleCounts = {};
@@ -341,6 +446,7 @@ function summarize(image, components, clusters) {
     detected: tiles.map(({ signature, ...t }) => t),
     available: available.map(({ signature, ...t }) => t),
     tray: tray.map(({ signature, ...t }) => t),
+    occlusionGraph,
     trayCounts,
     visibleCounts,
     safety: {
@@ -371,6 +477,26 @@ function chooseAction(state) {
     counts[type] >= 2 && !byType.has(type));
   if (blockedGroups.length) {
     if (!state.safety.liveAllowed) return { reason: 'safety-stop', tile: null, blockedGroups };
+
+    const releaseEdge = (state.occlusionGraph?.edges || [])
+      .filter(edge => blockedGroups.includes(edge.target.type))
+      .sort((a, b) => {
+        const confidence = (b.target.confidence || 0) - (a.target.confidence || 0);
+        return confidence || (b.target.overlap || 0) - (a.target.overlap || 0);
+      })[0];
+    if (releaseEdge) {
+      const cover = state.available.find(tile =>
+        tile.cx === releaseEdge.cover.cx && tile.cy === releaseEdge.cover.cy);
+      if (cover) {
+        return {
+          reason: 'release-hidden-match',
+          targetTypes: blockedGroups,
+          reveals: releaseEdge.target,
+          tile: cover,
+        };
+      }
+    }
+
     let chosen = null;
     for (const tile of state.available) {
       const underneath = (state.detected || []).filter(other =>
@@ -434,4 +560,12 @@ if (require.main === module) {
   main().catch(err => { console.error(err); process.exit(1); });
 }
 
-module.exports = { descriptor, distance, connectedComponents, boardAreaTiles, summarize, chooseAction };
+module.exports = {
+  descriptor,
+  distance,
+  connectedComponents,
+  boardAreaTiles,
+  buildOcclusionGraph,
+  summarize,
+  chooseAction,
+};

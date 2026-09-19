@@ -43,5 +43,16 @@ async function load(path) {
   });
   assert.equal(grouped.reason, 'start-exposed-pair');
   assert.equal(grouped.tile.type, 'cupcake');
+
+  const occlusionImage = await load('/tmp/tile_rescue_manual_carrot_check.png');
+  const occlusionState = summarize(
+    occlusionImage,
+    connectedComponents(occlusionImage),
+    [],
+  );
+  const occlusionAction = chooseAction(occlusionState);
+  assert.equal(occlusionAction.reason, 'release-hidden-match');
+  assert.equal(occlusionAction.tile.type, 'cupcake');
+  assert.equal(occlusionAction.reveals.type, 'carrot');
   console.log('vision/planner replay: ok');
 })().catch(err => { console.error(err); process.exit(1); });

@@ -19,6 +19,8 @@ O modo ao vivo espera a animação terminar após cada toque e nunca usa moedas,
 - se houver um par na bandeja sem terceira peça exposta, entra em modo de busca
   por uma peça escondida antes de iniciar outro grupo;
 - estende um grupo da bandeja antes de abrir uma peça sem relação;
+- constrói um grafo experimental de oclusão para relacionar uma peça parcial
+  com a carta que precisa ser liberada acima dela;
 - prefere pares já expostos;
 - interrompe antes de ocupar o último espaço quando não há correspondência direta;
 - usa o modelo somente como fallback futuro para ícones ambíguos, em vez de enviar uma imagem a cada movimento.
