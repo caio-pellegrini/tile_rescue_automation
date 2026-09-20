@@ -63,6 +63,88 @@
         "variant": null,
         "addedAt": "2026-09-20T02:25:48.247Z"
       }
+    ],
+    "pudding": [
+      {
+        "file": "pudding/board-0-539-715.png",
+        "sourceImage": "/tmp/tile-rescue-dry-run-20260920/move-000-before/vision/crops/board-0-539-715.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T18:36:27.796Z"
+      },
+      {
+        "file": "pudding/board-3-326-1177.png",
+        "sourceImage": "/tmp/tile-rescue-dry-run-20260920/move-000-before/vision/crops/board-3-326-1177.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T18:36:27.874Z"
+      }
+    ],
+    "cupcake": [
+      {
+        "file": "cupcake/board-1-611-645.png",
+        "sourceImage": "/tmp/tile-rescue-after-live-test-20260920-move3/move-000-before/vision/crops/board-1-611-645.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T18:49:04.442Z"
+      }
+    ],
+    "pepper": [
+      {
+        "file": "pepper/board-0-754-644.png",
+        "sourceImage": "/tmp/tile-rescue-after-live-test-20260920-move3/move-000-before/vision/crops/board-0-754-644.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T18:49:04.590Z"
+      },
+      {
+        "file": "pepper/board-3-611-785.png",
+        "sourceImage": "/tmp/tile-rescue-after-live-test-20260920-move3/move-000-before/vision/crops/board-3-611-785.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T18:49:04.743Z"
+      }
+    ],
+    "strawberry": [
+      {
+        "file": "strawberry/board-2-200-792.png",
+        "sourceImage": "/tmp/tile-rescue-level24-dry-20260920/move-000-before/vision/crops/board-2-200-792.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T20:56:37.971Z"
+      },
+      {
+        "file": "strawberry/board-3-336-792.png",
+        "sourceImage": "/tmp/tile-rescue-level24-dry-20260920/move-000-before/vision/crops/board-3-336-792.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T20:56:38.087Z"
+      },
+      {
+        "file": "strawberry/board-4-744-792.png",
+        "sourceImage": "/tmp/tile-rescue-level24-dry-20260920/move-000-before/vision/crops/board-4-744-792.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T20:56:38.200Z"
+      },
+      {
+        "file": "strawberry/board-7-610-930.png",
+        "sourceImage": "/tmp/tile-rescue-level24-dry-20260920/move-000-before/vision/crops/board-7-610-930.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T20:56:38.314Z"
+      }
+    ],
+    "peach": [
+      {
+        "file": "peach/tile-rescue-level24-peach-reference.png",
+        "sourceImage": "/tmp/tile-rescue-level24-peach-reference.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T20:56:38.429Z"
+      },
+      {
+        "file": "peach/board-0-608-524.png",
+        "sourceImage": "/tmp/tile-rescue-level24-dry-20260920/move-000-before/vision/crops/board-0-608-524.png",
+        "variant": "level24-board",
+        "addedAt": "2026-09-20T20:58:31.049Z"
+      },
+      {
+        "file": "peach/board-1-472-658.png",
+        "sourceImage": "/tmp/tile-rescue-level24-dry-20260920/move-000-before/vision/crops/board-1-472-658.png",
+        "variant": "level24-board",
+        "addedAt": "2026-09-20T20:58:31.157Z"
+      }
     ]
   }
 }

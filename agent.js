@@ -2,7 +2,12 @@ const { execFileSync } = require('node:child_process');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const sharp = require('sharp');
-const { applyVisionLabels, loadVisionLabels, writeVisionPacket } = require('./vision');
+const {
+  applyVisionLabels,
+  loadVisionLabels,
+  planningKeyForTile,
+  writeVisionPacket,
+} = require('./vision');
 
 const DEVICE = process.env.DEVICE || 'RQCY903RJQN';
 const LIVE = process.argv.includes('--live');
@@ -209,8 +214,10 @@ function semanticType(signature) {
   // broad orange=>sun rule.
   if (orange > 0.70 && signature[0] > 0.012) return 'chick';
   if (orange > 0.70) return 'sun';
-  if (green > 0.25) return 'corn';
-  if (green > 0.02 && green < 0.25 && blue + pink < 0.03) return 'carrot';
+  // Green icons are intentionally left unknown. The palette-only rules used
+  // to call them corn/carrot, but the current game uses green peppers too.
+  // A temporary visual group or a catalog reference is safer than a guessed
+  // canonical name.
   if (blue + pink > 0.03 && orange > 0.20) return 'cupcake';
   // Do not classify a weaker orange sun as a chick. The tray can change the
   // orange ratio slightly because cards overlap; a chick still needs the dark
@@ -232,12 +239,16 @@ function assignTypes(tiles, clusters = []) {
       tile.type = 'unknown';
       tile.typeSource = 'unknown';
       tile.typeDistance = Infinity;
+      tile.sessionGroupId = tile.sessionGroupId || tile.groupId || null;
+      tile.planningKey = planningKeyForTile(tile);
       continue;
     }
     const semantic = semanticType(tile.signature);
     if (semantic !== 'unknown') {
       tile.type = semantic;
       tile.groupId = semantic;
+      tile.sessionGroupId = semantic;
+      tile.planningKey = planningKeyForTile(tile);
       tile.typeSource = 'legacy-semantic';
       tile.typeDistance = 0;
       continue;
@@ -254,6 +265,8 @@ function assignTypes(tiles, clusters = []) {
     if (best && best.d < 0.10) {
       tile.type = 'unknown';
       tile.groupId = best.cluster.id;
+      tile.sessionGroupId = best.cluster.id;
+      tile.planningKey = planningKeyForTile(tile);
       tile.typeSource = 'visual-cluster';
       tile.typeDistance = Number(best.d.toFixed(4));
       best.cluster.prototype = best.cluster.prototype.map((v, i) => v * 0.85 + tile.signature[i] * 0.15);
@@ -262,6 +275,8 @@ function assignTypes(tiles, clusters = []) {
       clusters.push(cluster);
       tile.type = 'unknown';
       tile.groupId = cluster.id;
+      tile.sessionGroupId = cluster.id;
+      tile.planningKey = planningKeyForTile(tile);
       tile.typeSource = 'visual-cluster';
       tile.typeDistance = 0;
     }
@@ -667,9 +682,15 @@ function summarize(image, components, clusters) {
   const visible = tiles.filter(t => t.cy < BOARD_ROI.y1);
   const occlusionGraph = buildOcclusionGraph(image, available, tray);
   const trayCounts = {};
-  for (const t of tray) trayCounts[t.type] = (trayCounts[t.type] || 0) + 1;
+  for (const t of tray) {
+    const key = planningKeyForTile(t);
+    if (key) trayCounts[key] = (trayCounts[key] || 0) + 1;
+  }
   const visibleCounts = {};
-  for (const t of visible) visibleCounts[t.type] = (visibleCounts[t.type] || 0) + 1;
+  for (const t of visible) {
+    const key = planningKeyForTile(t);
+    if (key) visibleCounts[key] = (visibleCounts[key] || 0) + 1;
+  }
 
   return {
     screen: { width: image.info.width, height: image.info.height },
@@ -693,25 +714,139 @@ function summarize(image, components, clusters) {
 
 function chooseAction(state) {
   const counts = state.trayCounts;
-  const byType = new Map();
+  const byPlanningKey = new Map();
   for (const tile of state.available) {
-    if (!tile.type || tile.type === 'unknown') continue;
-    if (!byType.has(tile.type)) byType.set(tile.type, []);
-    byType.get(tile.type).push(tile);
+    const key = planningKeyForTile(tile);
+    if (!key) continue;
+    if (!byPlanningKey.has(key)) byPlanningKey.set(key, []);
+    byPlanningKey.get(key).push(tile);
   }
 
+  const isUnknownGroup = key => key.startsWith('group:');
+  const totalGroupCount = (key, tiles) => tiles.length + (counts[key] || 0);
+  const eligibleUnknownGroup = (key, tiles) => !isUnknownGroup(key) || totalGroupCount(key, tiles) >= 3;
+  const releaseScoreForTile = (tile, groupKey) => {
+    const edges = state.layerGraph?.edges || [];
+    const targets = new Map();
+    for (const edge of edges) {
+      if (!edge.cover || !edge.target) continue;
+      if (Math.hypot(edge.cover.cx - tile.cx, edge.cover.cy - tile.cy) > 48) continue;
+      if (edge.target.selectedCover &&
+        Math.hypot(edge.cover.cx - edge.target.selectedCover.cx,
+          edge.cover.cy - edge.target.selectedCover.cy) > 48) continue;
+      const targetKey = `${edge.target.cx},${edge.target.cy}`;
+      const targetPlanningKey = planningKeyForTile(edge.target);
+      const previous = targets.get(targetKey) || {
+        overlap: 0,
+        confidence: 0,
+        matching: targetPlanningKey === groupKey,
+      };
+      previous.overlap = Math.max(previous.overlap, edge.overlap || 0);
+      previous.confidence = Math.max(previous.confidence, edge.confidence || 0);
+      previous.matching ||= targetPlanningKey === groupKey;
+      targets.set(targetKey, previous);
+    }
+    const targetValues = [...targets.values()];
+    const matchingTargets = targetValues.filter(target => target.matching);
+    return {
+      targetCount: targetValues.length,
+      matchedTargetCount: matchingTargets.length,
+      weightedScore: Number(targetValues
+        .reduce((sum, target) => sum + target.overlap * target.confidence, 0)
+        .toFixed(4)),
+      matchedWeightedScore: Number(matchingTargets
+        .reduce((sum, target) => sum + target.overlap * target.confidence, 0)
+        .toFixed(4)),
+    };
+  };
+  const groupCandidate = (key, tiles) => {
+    const best = tiles
+      .map(tile => ({ tile, releaseScore: releaseScoreForTile(tile, key) }))
+      .sort((a, b) => b.releaseScore.matchedTargetCount - a.releaseScore.matchedTargetCount ||
+        b.releaseScore.matchedWeightedScore - a.releaseScore.matchedWeightedScore ||
+        b.releaseScore.targetCount - a.releaseScore.targetCount ||
+        b.releaseScore.weightedScore - a.releaseScore.weightedScore ||
+        a.tile.cy - b.tile.cy || a.tile.cx - b.tile.cx)[0];
+    return { key, tiles, ...best };
+  };
+  const compareGroupCandidates = (a, b) =>
+    b.tiles.length - a.tiles.length ||
+    b.releaseScore.matchedTargetCount - a.releaseScore.matchedTargetCount ||
+    b.releaseScore.matchedWeightedScore - a.releaseScore.matchedWeightedScore ||
+    a.key.localeCompare(b.key);
+  const targetFields = (key, tile) => isUnknownGroup(key)
+    ? { targetGroupId: tile.sessionGroupId || tile.groupId || key.slice('group:'.length) }
+    : { targetType: tile.type };
+
+  const exposedTripleCandidates = () => [...byPlanningKey.entries()]
+    .filter(([key, tiles]) => eligibleUnknownGroup(key, tiles) &&
+      (counts[key] || 0) === 0 && tiles.length >= 3)
+    .map(([key, tiles]) => groupCandidate(key, tiles))
+    .sort(compareGroupCandidates);
+
   // First priority: complete a triple already represented twice in the tray.
-  for (const [type, tiles] of byType) {
-    if ((counts[type] || 0) >= 2) return { reason: 'complete-triple', tile: tiles[0] };
+  const immediateTriples = [...byPlanningKey.entries()]
+    .filter(([key, tiles]) => eligibleUnknownGroup(key, tiles) && (counts[key] || 0) >= 2)
+    .map(([key, tiles]) => groupCandidate(key, tiles))
+    .sort(compareGroupCandidates);
+  if (immediateTriples.length) {
+    const candidate = immediateTriples[0];
+    return {
+      reason: 'complete-triple',
+      ...targetFields(candidate.key, candidate.tile),
+      releaseScore: candidate.releaseScore,
+      tile: candidate.tile,
+    };
+  }
+
+  // A single card in the tray plus two exposed copies completes a triple and
+  // frees a tray slot. This must beat blocked pairs and unrelated exposed
+  // groups, even when another pair is already waiting in the tray.
+  const trayTripleGroups = [...byPlanningKey.entries()]
+    .filter(([key, tiles]) => eligibleUnknownGroup(key, tiles) && (counts[key] || 0) === 1 && tiles.length >= 2)
+    .map(([key, tiles]) => groupCandidate(key, tiles))
+    .sort(compareGroupCandidates);
+  if (trayTripleGroups.length) {
+    const candidate = trayTripleGroups[0];
+    return {
+      reason: 'complete-triple-potential',
+      ...targetFields(candidate.key, candidate.tile),
+      availableCount: candidate.tiles.length,
+      releaseScore: candidate.releaseScore,
+      tile: candidate.tile,
+    };
+  }
+
+  // Starting a fully exposed triple is safer than extending a single pair,
+  // but only when all three taps can fit before the triple is removed.
+  const traySize = Array.isArray(state.tray)
+    ? state.tray.length
+    : Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const exposedTriples = exposedTripleCandidates();
+  if (traySize + 3 <= 7 && exposedTriples.length) {
+    const candidate = exposedTriples[0];
+    return {
+      reason: 'start-exposed-triple',
+      ...targetFields(candidate.key, candidate.tile),
+      availableCount: candidate.tiles.length,
+      releaseScore: candidate.releaseScore,
+      tile: candidate.tile,
+    };
   }
 
   // A pair in the tray has precedence over starting/expanding another group.
   // If its third copy is not exposed, the next move is explicitly a search
   // for the hidden copy, rather than silently treating another icon as safe.
-  const blockedGroups = Object.keys(counts).filter(type =>
-    counts[type] >= 2 && !byType.has(type));
+  const blockedGroups = Object.keys(counts).filter(key =>
+    counts[key] >= 2 && !byPlanningKey.has(key));
   if (blockedGroups.length) {
     if (!state.safety.liveAllowed) return { reason: 'safety-stop', tile: null, blockedGroups };
+    // A hidden card with the same visual group is not enough to authorize a
+    // search: hidden groups are intentionally not applied by vision.js. Do
+    // not turn an unknown tray pair into an arbitrary exploratory tap.
+    if (blockedGroups.some(isUnknownGroup)) {
+      return { reason: 'safety-stop', tile: null, blockedGroups };
+    }
 
     const releaseEdge = (state.occlusionGraph?.edges || [])
       .filter(edge => blockedGroups.includes(edge.target.type))
@@ -732,6 +867,23 @@ function chooseAction(state) {
       }
     }
 
+    // If the tray cannot fit an exposed triple, prefer a safe single-pair
+    // extension over exploratory searching for the blocked pair.
+    const trayPairs = [...byPlanningKey.entries()]
+      .filter(([key, tiles]) => eligibleUnknownGroup(key, tiles) &&
+        (counts[key] || 0) >= 1 && tiles.length >= 1)
+      .map(([key, tiles]) => groupCandidate(key, tiles))
+      .sort(compareGroupCandidates);
+    if (trayPairs.length) {
+      const candidate = trayPairs[0];
+      return {
+        reason: 'make-pair-with-tray',
+        ...targetFields(candidate.key, candidate.tile),
+        releaseScore: candidate.releaseScore,
+        tile: candidate.tile,
+      };
+    }
+
     let chosen = null;
     for (const tile of state.available) {
       const underneath = (state.detected || []).filter(other =>
@@ -744,43 +896,38 @@ function chooseAction(state) {
       : { reason: 'no-action', targetTypes: blockedGroups, tile: null };
   }
 
-  // A single card in the tray plus two exposed copies is already a complete
-  // triple opportunity. This must beat a generic pair extension and also beat
-  // starting an unrelated group.
-  const trayTripleGroups = [...byType.entries()]
-    .filter(([type, tiles]) => (counts[type] || 0) === 1 && tiles.length >= 2)
-    .sort((a, b) => b[1].length - a[1].length);
-  if (trayTripleGroups.length) {
-    const [type, tiles] = trayTripleGroups[0];
-    return {
-      reason: 'complete-triple-potential',
-      targetType: type,
-      availableCount: tiles.length,
-      tile: tiles[0],
-    };
-  }
-
   // A single-card tray group with one exposed copy is useful, but it is only
   // a pair extension and therefore comes after all visible triple options.
-  for (const [type, tiles] of byType) {
-    if ((counts[type] || 0) >= 1 && tiles.length >= 1) {
-      return { reason: 'make-pair-with-tray', tile: tiles[0] };
-    }
+  const trayPairs = [...byPlanningKey.entries()]
+    .filter(([key, tiles]) => eligibleUnknownGroup(key, tiles) && (counts[key] || 0) >= 1 && tiles.length >= 1)
+    .map(([key, tiles]) => groupCandidate(key, tiles))
+    .sort(compareGroupCandidates);
+  if (trayPairs.length) {
+    const candidate = trayPairs[0];
+    return {
+      reason: 'make-pair-with-tray',
+      ...targetFields(candidate.key, candidate.tile),
+      releaseScore: candidate.releaseScore,
+      tile: candidate.tile,
+    };
   }
 
   // If no tray group exists yet, prefer the largest exposed group. This is
   // deterministic and prevents spatial detection order from choosing a
   // singleton when three equal cards are already available.
-  const exposedGroups = [...byType.entries()]
-    .filter(([type, tiles]) => (counts[type] || 0) === 0 && tiles.length >= 2)
-    .sort((a, b) => b[1].length - a[1].length);
+  const exposedGroups = [...byPlanningKey.entries()]
+    .filter(([key, tiles]) => eligibleUnknownGroup(key, tiles) && (counts[key] || 0) === 0 &&
+      tiles.length >= (isUnknownGroup(key) ? 3 : 2))
+    .map(([key, tiles]) => groupCandidate(key, tiles))
+    .sort(compareGroupCandidates);
   if (exposedGroups.length) {
-    const [type, tiles] = exposedGroups[0];
+    const candidate = exposedGroups[0];
     return {
-      reason: tiles.length >= 3 ? 'start-exposed-triple' : 'start-exposed-pair',
-      targetType: type,
-      availableCount: tiles.length,
-      tile: tiles[0],
+      reason: candidate.tiles.length >= 3 ? 'start-exposed-triple' : 'start-exposed-pair',
+      ...targetFields(candidate.key, candidate.tile),
+      availableCount: candidate.tiles.length,
+      releaseScore: candidate.releaseScore,
+      tile: candidate.tile,
     };
   }
 
@@ -790,8 +937,9 @@ function chooseAction(state) {
   // Exploratory action: choose the exposed type seen most often on the board.
   let chosen = null;
   for (const tile of state.available) {
-    if (!tile.type || tile.type === 'unknown') continue;
-    const score = state.visibleCounts[tile.type] || 0;
+    const key = planningKeyForTile(tile);
+    if (!key || isUnknownGroup(key)) continue;
+    const score = state.visibleCounts[key] || 0;
     if (!chosen || score > chosen.score) chosen = { tile, score };
   }
   return chosen ? { reason: 'reveal-most-promising', tile: chosen.tile } : { reason: 'no-action', tile: null };
@@ -853,5 +1001,6 @@ module.exports = {
   buildOcclusionGraph,
   summarize,
   chooseAction,
+  planningKeyForTile,
   semanticType,
 };

@@ -33,6 +33,11 @@ estimada mascarada. O recorte original continua em `crops/` e a comparação
 fica disponível em `visible-contact-sheet.png`. Essa separação é necessária
 para não classificar a carta de cima como se fosse a carta escondida.
 
+Se houver mais de uma aresta candidata para o mesmo alvo, o pacote grava também
+`visible/<id>--cover-*.png`, uma imagem por hipótese de carta superior. O modelo
+compara cada variante com referências mascaradas pela mesma geometria e registra
+`coverCandidates`; não deve misturar duas cartas superiores numa única mancha.
+
 O mesmo pacote grava `layer-graph-overlay.png`. Nesse diagnóstico, `A` marca
 cartas disponíveis, `H` marca hipóteses ocultas e as linhas vermelhas mostram
 relações `likely-covers`. Ele serve para calibrar a geometria; não é uma
@@ -42,7 +47,8 @@ de 0,35 e ela estiver entre as duas melhores coberturas daquele alvo. O arquivo
 `layer-graph-validation.json` registra essas verificações e informa quantos
 alvos ficaram sem cobertura candidata.
 
-O recorte inclui a carta inteira ao redor do centro detectado. Portanto ele
+O recorte usa o retângulo geométrico real da carta, `142×160` pixels, alinhado
+às bordas estimadas em vez de um quadrado `144×144` ao redor do centro. Portanto ele
 continua podendo mostrar apenas uma fração do ícone de uma carta bloqueada;
 isso é desejado, pois o classificador precisa retornar também a confiança e as
 alternativas possíveis.
@@ -147,7 +153,7 @@ substitui silenciosamente a visão local.
   cartas parcialmente cobertas.
 - O grafo pode propor uma relação falsa quando duas cartas se sobrepõem pouco;
   por isso a confiança e o limiar de segurança devem ser mantidos.
-- A máscara usa um retângulo aproximado da carta superior; bordas arredondadas,
-  sombras e falsos candidatos ainda precisam de validação visual.
+- A máscara usa a interseção dos retângulos alinhados das cartas; bordas
+  arredondadas, sombras e falsos candidatos ainda precisam de validação visual.
 - Antes de habilitar qualquer classificador remoto, é necessário definir o
   tratamento das capturas e testar o custo/latência no dispositivo físico.

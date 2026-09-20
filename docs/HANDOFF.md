@@ -7,7 +7,7 @@ histórico das decisões, o estado atual e a ordem recomendada para continuar.
 ## 1. Objetivo do projeto
 
 Automatizar de forma conservadora um jogo Tile Rescue em um dispositivo Android
-controlado por ADB. O objetivo da automação é completar cada fase, e não
+controlado por ADB. O objetivo da automação é completar cada nível, e não
 maximizar a contagem opcional de sóis/recompensas. O agente deve:
 
 1. capturar a tela do jogo;
@@ -48,6 +48,10 @@ uma sequência que revele uma trinca escondida.
 - Um par simples na bandeja é uma opção posterior (`make-pair-with-tray`).
 - O agente deve parar antes de ocupar o último espaço sem uma correspondência
   direta (`safety-stop`).
+- Quando grupos empatam em quantidade, o grafo geométrico desempata a carta
+  dentro do grupo pela quantidade de alvos ocultos que ela cobre. A identidade
+  do alvo só participa da prioridade quando foi confirmada; um alvo `unknown`
+  nunca é tratado como uma trinca conhecida.
 - A ordem espacial da detecção não é uma estratégia. Contagens, bandeja e
   dependências de cobertura têm prioridade sobre a primeira coordenada lida.
 
@@ -61,9 +65,9 @@ referências visuais diferentes no catálogo local.
 
 O contador de sóis no header não é o objetivo operacional desta automação.
 
-### Ícones variáveis por fase
+### Ícones variáveis por nível
 
-Os ícones não são fixos entre fases ou sessões. Já foram observados, entre
+Os ícones não são fixos entre níveis ou sessões. Já foram observados, entre
 outros, `blueberry`, `butterfly`, `cake`, `sun`, `corn`, `carrot` e `chick`.
 Por isso, nomes antigos como `whale`, `tile-0` ou grupos genéricos não devem
 ser usados como rótulos humanos permanentes. O catálogo usa nomes canônicos em
@@ -109,8 +113,12 @@ Gera o pacote auditável de visão:
 - `layer-graph-validation.json`: validação das arestas;
 - `analysis.json`: estado e decisão daquela observação.
 
-O grafo é diagnóstico. Uma carta `hidden` nunca é diretamente tocável; a ação
-deve usar uma carta `available` que cobre/libera a carta escondida.
+O grafo é principalmente diagnóstico e também fornece uma pontuação geométrica
+de liberação para desempates dentro de um grupo. Uma carta `hidden` nunca é
+diretamente tocável; a ação deve usar uma carta `available` que cobre/libera a
+carta escondida. O número de arestas, sozinho, não prova a identidade do alvo:
+targets `unknown` não autorizam formar uma trinca nem substituem a classificação
+do ícone.
 
 ### `local_ml.js`
 
@@ -125,10 +133,30 @@ deve usar uma carta `available` que cobre/libera a carta escondida.
 - variantes do sol continuam sendo `sun` logicamente;
 - abaixo do limiar, o resultado é `unknown`.
 
+O estado de uma carta separa três identidades:
+
+- `type`: nome canônico confirmado, como `sun`;
+- `sessionGroupId`: grupo visual temporário da captura/nível, como
+  `unlabeled-group-1`;
+- `planningKey`: `type` quando confirmado ou `group:<sessionGroupId>` quando
+  há somente uma identidade visual confiável.
+
+Assim, um ícone novo pode participar de uma trinca sem ser batizado antes. Um
+grupo desconhecido só é aceito para o planejamento quando possui pelo menos
+duas ocorrências jogáveis e a oportunidade tem três cartas no total. Grupos
+desconhecidos não são usados para exploração singleton, e cartas `hidden` não
+ganham autorização de clique.
+
 O limiar de similaridade do classificador é `0.88` por padrão. O limiar para
 aplicar rótulos externos ao planejador é `0.75`. Um resultado `unknown` nunca
 deve apagar uma semântica legada já confiável; ele permanece no JSON para
-diagnóstico.
+diagnóstico e pode preservar um `sessionGroupId` jogável quando houver
+evidência suficiente. O limiar global de `0.88` não foi reduzido.
+
+As heurísticas de cor verde que antes produziam `corn` ou `carrot` foram
+desativadas: pimentões verdes permanecem `unknown` até uma referência nomeada
+ou um grupo visual consistente. Isso evita transformar uma cor em um nome
+canônico incorreto.
 
 O recurso importante é `createClassifier()`: o encoder e os embeddings das
 referências são carregados uma vez por execução e reutilizados entre os
@@ -144,11 +172,12 @@ movimentos.
 4. capturar a tela;
 5. gerar o pacote de visão;
 6. classificar todos os recortes em lote;
-7. aplicar apenas rótulos aceitos;
-8. chamar `chooseAction()`;
-9. gravar a decisão;
-10. em `--live`, tocar a coordenada e esperar a animação;
-11. salvar a captura `after`, que vira a próxima observação.
+7. aplicar rótulos aceitos e preservar grupos visuais desconhecidos;
+8. salvar `phase-map.json` com os grupos e evidências do nível;
+9. chamar `chooseAction()`;
+10. gravar a decisão;
+11. em `--live`, tocar a coordenada e esperar a animação;
+12. salvar a captura `after`, que vira a próxima observação.
 
 O padrão é dry-run. Nenhum toque ocorre sem `--live`.
 
@@ -166,10 +195,13 @@ O catálogo atual contém referências para:
 blueberry   2 referências
 butterfly   1 referência
 cake        2 referências
+cupcake     1 referência
+pepper      2 referências
+pudding     2 referências
 sun         3 referências/variantes
 ```
 
-Para adicionar um ícone novo descoberto numa fase:
+Para adicionar um ícone novo descoberto num nível:
 
 ```bash
 node local_ml.js --add-reference /tmp/pacote-de-visao tile-id blueberry
@@ -244,6 +276,7 @@ Exemplo:
 │       ├── manifest.json
 │       ├── analysis.json
 │       ├── local-predictions.json
+│       ├── phase-map.json
 │       ├── crops/
 │       ├── visible/
 │       ├── contact-sheet.png
@@ -258,21 +291,21 @@ referências, tempo de espera e quantidade de toques realmente executados.
 
 ## 7. Histórico de mudanças
 
-### Fase 1 — baseline
+### Nível 1 — baseline
 
 O projeto começou como um planejador simples via ADB, com detecção por cor,
 componentes conectados e seleção de peças pela ordem detectada. Essa versão
 era útil para protótipos, mas confundia ordem espacial com prioridade e não
 modelava cartas cobertas.
 
-### Fase 2 — ROI contínua e bandeja
+### Nível 2 — ROI contínua e bandeja
 
 As duas fileiras fixas foram substituídas por uma área contínua do tabuleiro.
 Header, bandeja, botões e anúncio passaram a ficar fora da ROI. O detector da
 bandeja ganhou slots fixos, e o limiar foi reduzido para não perder ícones
 azuis como `blueberry`.
 
-### Fase 3 — prioridade de trincas
+### Nível 3 — prioridade de trincas
 
 Os testes mostraram que formar um par não é o objetivo final. A prioridade foi
 alterada para reconhecer explicitamente:
@@ -282,7 +315,7 @@ alterada para reconhecer explicitamente:
 - três livres do mesmo ícone;
 - só depois extensões simples de pares.
 
-### Fase 4 — grafo de oclusão
+### Nível 4 — grafo de oclusão
 
 Foi adicionado um grafo experimental `carta superior -> carta inferior` para
 representar o fato de que uma cenoura ou cupcake pode estar visível, mas
@@ -294,7 +327,7 @@ região abaixo do tabuleiro era confundida com cartas. A ROI foi reduzida para
 `y=1260`, as arestas fracas foram descartadas e cada alvo ficou limitado às
 duas coberturas mais fortes.
 
-### Fase 5 — pacote de visão
+### Nível 5 — pacote de visão
 
 Foi criado um pacote com screenshots, recortes, contact sheets, máscara de
 visibilidade, overlay e manifesto. Isso separou três problemas que antes
@@ -304,14 +337,14 @@ estavam misturados:
 2. identificar seu ícone;
 3. decidir se ela é tocável.
 
-### Fase 6 — ML local e rótulos nomeados
+### Nível 6 — ML local e rótulos nomeados
 
 Foi descartada a ideia de depender de uma IA remota. O projeto adotou
 embeddings locais em CPU e um catálogo persistente com nomes como `blueberry`,
 `butterfly`, `cake` e `sun`. Referências múltiplas passaram a cobrir ícones
-variáveis entre fases e as três aparências do sol.
+variáveis entre níveis e as três aparências do sol.
 
-### Fase 7 — runner consolidado
+### Nível 7 — runner consolidado
 
 Os comandos Node inline foram substituídos por `play.js`. O modelo é carregado
 uma vez, os movimentos são registrados por pasta e dry-run virou o padrão.
@@ -328,7 +361,7 @@ rótulos legados úteis.
   identidade de uma carta cuja fração visível seja muito pequena.
 - Um ícone sem referência pode permanecer `unknown`; o planejador evita tocar
   nele por segurança. É preciso cadastrar uma referência antes de confiar em
-  novas fases.
+  novas níveis.
 - O modelo consome CPU e RAM durante a carga. O desenho foi escolhido para um
   PC com 16 GB de RAM e sem GPU dedicada, mas o tempo de carga/inferência deve
   ser medido em cada máquina.
@@ -381,3 +414,82 @@ revisão; nenhuma jogada ao vivo deve ser presumida.
 Não alterar simultaneamente o detector, o classificador e o planejador sem
 guardar uma captura de referência: isso dificulta saber se um erro veio da
 localização, da identidade ou da estratégia.
+
+Para cartas parcialmente cobertas, o pipeline mantém dois artefatos distintos:
+o recorte bruto, útil para auditoria humana, e o recorte `visible/`, no qual a
+interseção da carta superior é mascarada. O classificador também gera
+referências equivalentes em `reference-variants/`, com a mesma máscara da carta
+inferior, para não comparar um fragmento do ícone contra uma referência inteira
+nem confundir pixels da carta superior com o alvo. O manifesto registra a
+geometria em `visibleMask`. Essa técnica é semântica apenas: uma carta
+`hidden` continua não clicável até que o grafo a torne disponível.
+Correspondências parciais só podem virar nome quando a área visível é suficiente,
+há margem sobre a segunda classe e existem pelo menos duas cópias completas
+confirmadas do mesmo rótulo no nível; o limiar geral de `0.88` permanece aplicado
+às cartas completas.
+
+Os recortes agora respeitam o retângulo geométrico das cartas, `142×160` pixels.
+Não usar novamente um quadrado `144×144` para validar a máscara de uma carta
+inferior: o desalinhamento pode preservar a carta superior e remover a região
+errada do alvo.
+
+Depois da classificação, `applyVisionLabels()` sincroniza os rótulos dos nós
+ocultos com as cópias dos endpoints nas arestas de `layerGraph` e
+`occlusionGraph`. Isso é necessário para que o score de liberação reconheça
+uma carta disponível que revela uma cópia do mesmo ícone; o alvo continua
+`hidden` e não é clicável.
+
+Quando um alvo possui mais de uma cobertura candidata, o pacote gera um
+`visibleVariant` por cover, em vez de unir todas as máscaras. O classificador
+registra `coverCandidates` e escolhe a máscara com maior evidência discriminativa
+quando as hipóteses concordam no ícone. A escolha é copiada para
+`hidden.selectedCover`; o planejador usa essa relação específica e não conta
+uma carta superior concorrente como se também liberasse o alvo.
+
+### Grupos visuais temporários e pudins do nível 23
+
+Na captura `/tmp/tile-rescue-dry-run-20260920`, o modelo classificou quatro
+cartas marrons como `unknown`, com alternativa `cake` entre 0,82 e 0,84,
+abaixo do limiar nomeado de 0,88. O embedding, porém, colocou as quatro em
+`unlabeled-group-1`. Antes desta correção, `chooseAction()` descartava
+`unknown` e recomendava `start-exposed-pair` para os dois sóis.
+
+O planejador agora usa o grupo temporário para retornar
+`start-exposed-triple`, com `targetGroupId: unlabeled-group-1`, sem afirmar que
+o ícone é `cake` ou `pudding`. Cada pacote também grava `phase-map.json`, que
+permite auditar essa decisão e distinguir nomes canônicos de agrupamentos
+locais.
+
+## 11. Nível 23 concluída
+
+Após a correção final de prioridade, o runner completou o nível 23 com nove
+movimentos reais em `/tmp/tile-rescue-live-next9-20260920`. A sequência foi:
+
+- três `cake`, removendo a trinca;
+- três `pudding`, removendo a trinca;
+- três `sun`, removendo a trinca.
+
+O `run.json` registrou `executedMoves: 9` e `finishedAt` normalmente. Não houve
+intervenção manual durante essa sequência. O estado final confirmou a conclusão
+do nível; o próximo trabalho deve começar com uma nova captura e dry-run para o
+nível seguinte, sem assumir que os ícones ou a disposição serão os mesmos.
+
+O ajuste decisivo foi a ordem de `chooseAction()`: completar uma trinca
+potencial (`1` na bandeja + `2` livres) vem antes de iniciar uma trinca nova;
+uma trinca de três cartas livres vem depois, mas somente quando há três espaços
+disponíveis; pares simples e buscas por cartas ocultas ficam abaixo dessas
+opções seguras.
+
+## 12. Preparação do nível 24
+
+O nível 24 foi capturado sem toques em `/tmp/tile-rescue-level24-current.png`.
+Os novos ícones identificados são `strawberry` e `peach`; o ícone laranja tem
+formato de pêssego, não de manga. A biblioteca local agora contém quatro
+referências de morango e três referências de pêssego, registradas em
+`icon-library/catalog.json`.
+
+O dry-run posterior reconheceu os quatro morangos livres com confiança entre
+0,9854 e 0,9910 e classificou ocorrências parcialmente cobertas do pêssego
+com evidência `peach`. Nenhum movimento do nível 24 foi executado. Antes de
+jogar, fazer nova captura/dry-run quando a tela estiver novamente no tabuleiro;
+não assumir que uma carta atualmente `hidden` pode ser tocada.

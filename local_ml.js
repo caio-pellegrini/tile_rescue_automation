@@ -1,10 +1,17 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const sharp = require('sharp');
 
 const DEFAULT_MODEL = process.env.LOCAL_VISION_MODEL || 'Xenova/clip-vit-base-patch32';
 const DEFAULT_THRESHOLD = Number(process.env.LOCAL_VISION_THRESHOLD || 0.88);
+const PARTIAL_REFERENCE_THRESHOLD = Number(process.env.LOCAL_VISION_PARTIAL_THRESHOLD || 0.80);
+const PARTIAL_MIN_VISIBLE_FRACTION = 0.45;
+const PARTIAL_MIN_MARGIN = 0.01;
+const PARTIAL_STRONG_COVER_MARGIN = 0.005;
+const PARTIAL_CONFIRMED_PEERS = 2;
 const DEFAULT_LIBRARY_DIR = process.env.LOCAL_VISION_LIBRARY || path.resolve('icon-library');
 const CATALOG_FILE = 'catalog.json';
+const MASK_BACKGROUND = '#149b7d';
 
 function cosine(a, b) {
   let dot = 0;
@@ -37,6 +44,87 @@ async function embedPaths(extractor, paths) {
     vectors.push(normalize(Array.from(output.data.slice(i * dimensions, (i + 1) * dimensions))));
   }
   return vectors;
+}
+
+function coverRect(cover) {
+  return {
+    left: Math.round(cover.cx - 71),
+    top: Math.round(cover.cy - 80),
+    width: 142,
+    height: 160,
+  };
+}
+
+function intersection(a, b) {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.left + a.width, b.left + b.width);
+  const bottom = Math.min(a.top + a.height, b.top + b.height);
+  if (right <= left || bottom <= top) return null;
+  return { left, top, width: right - left, height: bottom - top };
+}
+
+function visibleMaskSvg(box, covers, outputWidth = box.width, outputHeight = box.height) {
+  const scaleX = outputWidth / box.width;
+  const scaleY = outputHeight / box.height;
+  const rects = (covers || [])
+    .map(cover => intersection(box, coverRect(cover)))
+    .filter(Boolean)
+    .map(rect => `<rect x="${(rect.left - box.left) * scaleX}" y="${(rect.top - box.top) * scaleY}" width="${rect.width * scaleX}" height="${rect.height * scaleY}" fill="${MASK_BACKGROUND}"/>`)
+    .join('');
+  return Buffer.from(`<svg width="${outputWidth}" height="${outputHeight}"><g>${rects}</g></svg>`);
+}
+
+async function buildPartialReferencePaths(packetDir, hiddenTiles, references) {
+  const variantDir = path.join(packetDir, 'reference-variants');
+  const entries = [];
+  let created = 0;
+  for (const tile of hiddenTiles) {
+    const variants = tile.visibleVariants?.length
+      ? tile.visibleVariants
+      : (tile.visibleCrop && (tile.maskedBy || tile.coveredBy || []).length
+        ? [{
+          key: 'primary',
+          crop: tile.visibleCrop,
+          cover: (tile.maskedBy || tile.coveredBy)[0],
+        }]
+        : []);
+    if (!variants.length || !tile.box) continue;
+    await fs.mkdir(variantDir, { recursive: true });
+    for (const visibleVariant of variants) {
+      if (!visibleVariant.cover) continue;
+      for (const reference of references) {
+        const safeId = `${tile.id}--${visibleVariant.key}--${reference.label}--${reference.variant || 'default'}`
+          .replace(/[^a-z0-9_.-]+/gi, '_');
+        const outputPath = path.join(variantDir, `${safeId}.png`);
+        const referenceBuffer = await fs.readFile(reference.filePath);
+        const referenceMetadata = await sharp(referenceBuffer).metadata();
+        await sharp(referenceBuffer)
+          .composite([{
+            input: visibleMaskSvg(
+              tile.box,
+              [visibleVariant.cover],
+              referenceMetadata.width || tile.box.width,
+              referenceMetadata.height || tile.box.height,
+            ),
+            left: 0,
+            top: 0,
+          }])
+          .png()
+          .toFile(outputPath);
+        entries.push({
+          ...reference,
+          filePath: outputPath,
+          view: 'masked-visible',
+          tileId: tile.id,
+          visibleVariantKey: visibleVariant.key,
+          selectedCover: visibleVariant.cover,
+        });
+        created++;
+      }
+    }
+  }
+  return { entries, created, variantDir: created ? 'reference-variants/' : null };
 }
 
 async function loadCatalog(libraryDir = DEFAULT_LIBRARY_DIR) {
@@ -187,41 +275,144 @@ async function classifyPacketWithResources(packetDir, resources) {
     };
   }
 
-  // Hidden candidates use a crop with the estimated cover card masked out.
-  // The raw crop remains in the packet for human audit and fallback.
-  const tilePaths = tiles.map(tile => path.join(packetDir, tile.visibleCrop || tile.crop));
   const started = Date.now();
-  const tileEmbeddings = await embedPaths(extractor, tilePaths);
+  const hiddenTiles = tiles.filter(tile => tile.role === 'hidden');
+  const partialReferences = await buildPartialReferencePaths(packetDir, hiddenTiles, references.entries);
+  const partialReferenceEntries = partialReferences.entries;
+  const partialReferenceEmbeddings = partialReferenceEntries.length
+    ? await embedPaths(extractor, partialReferenceEntries.map(entry => entry.filePath))
+    : [];
+  const partialReferenceByVariant = new Map();
+  for (let index = 0; index < partialReferenceEntries.length; index++) {
+    const entry = partialReferenceEntries[index];
+    const key = `${entry.tileId}::${entry.visibleVariantKey}`;
+    if (!partialReferenceByVariant.has(key)) partialReferenceByVariant.set(key, []);
+    partialReferenceByVariant.get(key).push({ ...entry, prototype: partialReferenceEmbeddings[index] });
+  }
 
-  const preliminary = tiles.map((tile, index) => {
-    const matchesByLabel = new Map();
-    for (const reference of referencePrototypes) {
-      const confidence = cosine(tileEmbeddings[index], reference.prototype);
-      const previous = matchesByLabel.get(reference.label);
-      if (!previous || confidence > previous.confidence) {
-        matchesByLabel.set(reference.label, {
-          label: reference.label,
-          variant: reference.variant,
-          file: reference.file,
-          confidence,
-        });
-      }
+  const tileInputs = [];
+  for (const tile of tiles) {
+    const variants = tile.role === 'hidden' && tile.visibleVariants?.length
+      ? tile.visibleVariants
+      : [{
+        key: null,
+        crop: tile.visibleCrop || tile.crop,
+        cover: tile.maskedBy?.[0] || tile.coveredBy?.[0] || null,
+      }];
+    for (const visibleVariant of variants) {
+      tileInputs.push({
+        tile,
+        visibleVariantKey: visibleVariant.key,
+        selectedCover: visibleVariant.cover || null,
+        filePath: path.join(packetDir, visibleVariant.crop),
+      });
     }
-    const matches = [...matchesByLabel.values()].sort((a, b) => b.confidence - a.confidence);
-    const best = matches[0] || null;
-    return { tile, index, best, alternatives: matches.slice(1, 3) };
+  }
+  const tileEmbeddings = await embedPaths(extractor, tileInputs.map(input => input.filePath));
+  const inputsByTile = new Map();
+  for (let index = 0; index < tileInputs.length; index++) {
+    const input = { ...tileInputs[index], embedding: tileEmbeddings[index] };
+    if (!inputsByTile.has(input.tile.id)) inputsByTile.set(input.tile.id, []);
+    inputsByTile.get(input.tile.id).push(input);
+  }
+
+  const preliminary = tiles.map(tile => {
+    const options = inputsByTile.get(tile.id) || [];
+    const optionResults = options.map(option => {
+      const matchesByLabel = new Map();
+      const partialEntriesForVariant = tile.role === 'hidden'
+        ? partialReferenceByVariant.get(`${tile.id}::${option.visibleVariantKey}`) || []
+        : [];
+      const candidateReferences = partialEntriesForVariant.length
+        ? partialEntriesForVariant
+        : referencePrototypes;
+      for (const reference of candidateReferences) {
+        const confidence = cosine(option.embedding, reference.prototype);
+        const previous = matchesByLabel.get(reference.label);
+        if (!previous || confidence > previous.confidence) {
+          matchesByLabel.set(reference.label, {
+            label: reference.label,
+            variant: reference.variant,
+            file: reference.file,
+            confidence,
+            view: reference.view || 'full',
+            selectedCover: option.selectedCover,
+            visibleVariantKey: option.visibleVariantKey,
+          });
+        }
+      }
+      const matches = [...matchesByLabel.values()].sort((a, b) => b.confidence - a.confidence);
+      return { option, best: matches[0] || null, matches };
+    }).filter(result => result.best);
+    const marginOf = result => result.best && result.matches[1]
+      ? result.best.confidence - result.matches[1].confidence
+      : 0;
+    optionResults.sort((a, b) => {
+      const sameLabel = a.best?.label && a.best.label === b.best?.label;
+      const marginDifference = marginOf(b) - marginOf(a);
+      const confidenceDifference = a.best.confidence - b.best.confidence;
+      // When both masks produce the same icon, a larger separation from the
+      // next class is stronger evidence that this cover isolates the target
+      // instead of merely leaving a visually similar fragment. Do not use
+      // this tie-break when the masks disagree on the icon.
+      if (sameLabel && Math.abs(marginDifference) >= 0.015 && Math.abs(confidenceDifference) <= 0.04) {
+        return marginDifference;
+      }
+      return b.best.confidence - a.best.confidence;
+    });
+    const selected = optionResults[0] || { option: options[0], best: null, matches: [] };
+    return {
+      tile,
+      embedding: selected.option?.embedding,
+      selectedCover: selected.best?.selectedCover || selected.option?.selectedCover || null,
+      visibleVariantKey: selected.best?.visibleVariantKey || selected.option?.visibleVariantKey || null,
+      best: selected.best,
+      matches: selected.matches,
+      alternatives: selected.matches.slice(1, 3),
+      coverCandidates: optionResults.map(result => ({
+        visibleVariantKey: result.option.visibleVariantKey,
+        selectedCover: result.option.selectedCover,
+        bestLabel: result.best?.label || null,
+        bestConfidence: result.best ? Number(result.best.confidence.toFixed(4)) : null,
+        margin: result.best && result.matches[1]
+          ? Number((result.best.confidence - result.matches[1].confidence).toFixed(4))
+          : null,
+      })),
+    };
   });
   const unknownItems = preliminary.filter(item => !item.best || item.best.confidence < threshold);
   const unknownTiles = unknownItems.map(item => item.tile);
-  const unknownEmbeddings = unknownItems.map(item => tileEmbeddings[item.index]);
+  const unknownEmbeddings = unknownItems.map(item => item.embedding);
   const unknownGroups = groupEmbeddings(unknownTiles, unknownEmbeddings, threshold);
   const unknownById = new Map(unknownGroups.predictions.map(prediction => [prediction.id, prediction]));
+  const confirmedLabelCounts = new Map();
+  for (const item of preliminary) {
+    if (item.tile.role === 'hidden' || !item.best || item.best.confidence < threshold) continue;
+    confirmedLabelCounts.set(item.best.label, (confirmedLabelCounts.get(item.best.label) || 0) + 1);
+  }
 
   const predictions = preliminary.map(item => {
     const visibleFraction = item.tile.role === 'hidden'
       ? Number((item.tile.visibility || 0).toFixed(3))
       : 1;
-    if (item.best && item.best.confidence >= threshold) {
+    const secondBest = item.matches[1] || null;
+    const partialMargin = item.best && secondBest
+      ? item.best.confidence - secondBest.confidence
+      : item.best?.confidence || 0;
+    const partialMarginThreshold = item.selectedCover &&
+      Number(item.selectedCover.confidence) >= 0.90
+      ? PARTIAL_STRONG_COVER_MARGIN
+      : PARTIAL_MIN_MARGIN;
+    const partialNamed = Boolean(
+      item.tile.role === 'hidden' &&
+      item.best?.view === 'masked-visible' &&
+      item.selectedCover &&
+      item.best.confidence >= PARTIAL_REFERENCE_THRESHOLD &&
+      visibleFraction >= PARTIAL_MIN_VISIBLE_FRACTION &&
+      partialMargin >= partialMarginThreshold &&
+      (confirmedLabelCounts.get(item.best.label) || 0) >= PARTIAL_CONFIRMED_PEERS,
+    );
+    if (item.best && (item.best.confidence >= threshold || partialNamed)) {
       return {
         id: item.tile.id,
         label: item.best.label,
@@ -229,6 +420,17 @@ async function classifyPacketWithResources(packetDir, resources) {
         referenceLabel: item.best.label,
         referenceVariant: item.best.variant,
         referenceFile: item.best.file,
+        referenceView: item.best.view || 'full',
+        visibleVariant: item.visibleVariantKey,
+        selectedCover: item.selectedCover,
+        coverCandidates: item.coverCandidates,
+        partialEvidence: partialNamed ? {
+          threshold: PARTIAL_REFERENCE_THRESHOLD,
+          marginThreshold: partialMarginThreshold,
+          margin: Number(partialMargin.toFixed(4)),
+          visibleFraction,
+          confirmedPeers: confirmedLabelCounts.get(item.best.label) || 0,
+        } : null,
         confidence: Number(item.best.confidence.toFixed(4)),
         visibleFraction,
         alternatives: item.alternatives.map(alternative => ({
@@ -244,9 +446,15 @@ async function classifyPacketWithResources(packetDir, resources) {
       groupId: unknown.groupId,
       confidence: Number(Math.max(0, item.best?.confidence || unknown.confidence || 0).toFixed(4)),
       visibleFraction,
-      alternatives: item.best
-        ? [{ label: item.best.label, confidence: Number(item.best.confidence.toFixed(4)) }]
-        : [],
+      visibleVariant: item.visibleVariantKey,
+      selectedCover: item.selectedCover,
+      coverCandidates: item.coverCandidates,
+      alternatives: item.matches.slice(0, 3).map(match => ({
+        label: match.label,
+        confidence: Number(match.confidence.toFixed(4)),
+        view: match.view || 'full',
+      })),
+      partialMargin: Number(partialMargin.toFixed(4)),
     };
   });
 
@@ -259,6 +467,7 @@ async function classifyPacketWithResources(packetDir, resources) {
     libraryDir,
     referenceCount: references.entries.length,
     missingReferences: references.missing,
+    referenceVariants: partialReferences.variantDir,
     tileCount: tiles.length,
     inferenceMs: Date.now() - started,
     predictions,

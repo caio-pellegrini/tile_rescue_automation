@@ -103,10 +103,72 @@ function tileForLog(tile) {
   return {
     type: tile.type || 'unknown',
     groupId: tile.groupId || null,
+    sessionGroupId: tile.sessionGroupId || null,
+    planningKey: tile.planningKey || null,
+    modelLabel: tile.modelLabel || null,
+    modelGroupId: tile.modelGroupId || null,
+    modelConflict: tile.modelConflict || null,
     x: tile.cx,
     y: tile.cy,
     confidence: tile.modelConfidence ?? tile.confidence ?? null,
     source: tile.typeSource || null,
+  };
+}
+
+function buildPhaseMap(state) {
+  const groups = new Map();
+  const add = (tile, role) => {
+    const planningKey = tile.planningKey || (
+      tile.type && tile.type !== 'unknown' ? tile.type : null
+    );
+    const sessionGroupId = tile.sessionGroupId || tile.groupId || null;
+    const key = planningKey || (sessionGroupId
+      ? `group:${sessionGroupId}`
+      : `unmapped:${role}:${tile.cx},${tile.cy}`);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        planningKey,
+        sessionGroupId,
+        type: tile.type && tile.type !== 'unknown' ? tile.type : 'unknown',
+        typeSource: tile.typeSource || null,
+        members: [],
+        counts: { available: 0, tray: 0, hidden: 0 },
+        confidences: [],
+      });
+    }
+    const group = groups.get(key);
+    group.members.push({
+      role,
+      x: tile.cx,
+      y: tile.cy,
+      type: tile.type || 'unknown',
+      typeSource: tile.typeSource || null,
+      confidence: tile.modelConfidence ?? tile.confidence ?? null,
+    });
+    group.counts[role]++;
+    const confidence = tile.modelConfidence ?? tile.confidence;
+    if (Number.isFinite(confidence)) group.confidences.push(confidence);
+  };
+
+  for (const tile of state.available || []) add(tile, 'available');
+  for (const tile of state.tray || []) add(tile, 'tray');
+  for (const tile of state.layerGraph?.hidden || []) add(tile, 'hidden');
+
+  return {
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    screen: state.screen,
+    groups: [...groups.values()].map(group => ({
+      ...group,
+      evidence: {
+        playableCount: group.counts.available + group.counts.tray,
+        strongEnoughForUnknownTriple: group.type !== 'unknown' ||
+          group.counts.available + group.counts.tray >= 3,
+        meanConfidence: group.confidences.length
+          ? Number((group.confidences.reduce((sum, value) => sum + value, 0) / group.confidences.length).toFixed(4))
+          : null,
+      },
+    })),
   };
 }
 
@@ -142,6 +204,7 @@ async function analyze(image, options, clusters, classifier, packetDir) {
   }
 
   const action = chooseAction(state);
+  await writeJson(path.join(packetDir, 'phase-map.json'), buildPhaseMap(state));
   const analysis = {
     capturedAt: new Date().toISOString(),
     state,
@@ -180,7 +243,7 @@ function consoleSummary(move, options, analysis) {
     move,
     mode: options.live ? 'live' : 'dry-run',
     recommendation: action.reason || 'no-action',
-    target: action.targetType || null,
+    target: action.targetType || action.targetGroupId || null,
     tile,
     tray: analysis.stateSummary.tray,
     available: analysis.stateSummary.available,
@@ -283,6 +346,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildPhaseMap,
   parseArgs,
   stateForLog,
   tileForLog,

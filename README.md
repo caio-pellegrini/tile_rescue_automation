@@ -52,7 +52,7 @@ ambíguos a um modelo local, em lote, sem colocar uma inferência em cada
 movimento. `local_ml.js` compara embeddings contra a biblioteca nomeada em
 `icon-library/catalog.json`. Para cadastrar uma carta nova, use
 `--add-reference` uma vez com o nome em inglês; referências adicionais do mesmo
-ícone podem ser cadastradas para cobrir variações entre fases. Ícones abaixo do
+ícone podem ser cadastradas para cobrir variações entre níveis. Ícones abaixo do
 limiar ficam como `unknown`, em vez de receber um nome inventado. O agente
 continua responsável por geometria, oclusão e decisão de toque.
 
