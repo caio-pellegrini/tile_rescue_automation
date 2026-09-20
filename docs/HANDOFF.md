@@ -493,3 +493,15 @@ O dry-run posterior reconheceu os quatro morangos livres com confiança entre
 com evidência `peach`. Nenhum movimento do nível 24 foi executado. Antes de
 jogar, fazer nova captura/dry-run quando a tela estiver novamente no tabuleiro;
 não assumir que uma carta atualmente `hidden` pode ser tocada.
+
+## 13. Detecção de conclusão
+
+O runner verifica o estado imediatamente após cada toque. Se não houver cartas
+`available`, `hidden`, na bandeja ou componentes detectados, grava
+`completed: true` com `completionReason: "empty-board"` no `run.json` e no
+`after.json`, encerrando a execução. `safety-stop` e `no-action` são registrados
+separadamente em `stopReason`.
+
+Antes de aceitar `empty-board`, o runner valida pontos do fundo teal do jogo
+na captura. Isso evita marcar como concluído um aparelho bloqueado, carregando
+ou com a tela apagada.

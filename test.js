@@ -4,7 +4,7 @@ const sharp = require('sharp');
 const { connectedComponents, semanticType, summarize, chooseAction } = require('./agent');
 const { applyVisionLabels, buildVisionManifest, cropBox, validateLayerGraph } = require('./vision');
 const { groupEmbeddings } = require('./local_ml');
-const { buildPhaseMap, parseArgs } = require('./play');
+const { buildPhaseMap, detectTerminalStatus, parseArgs } = require('./play');
 
 async function load(path) {
   return sharp(fs.readFileSync(path)).raw().toBuffer({ resolveWithObject: true });
@@ -29,6 +29,33 @@ async function load(path) {
     runDir: null,
     useMl: false,
   });
+  assert.deepEqual(detectTerminalStatus({
+    state: { available: [], tray: [], layerGraph: { hidden: [] } },
+    action: { reason: 'no-action', tile: null },
+  }), {
+    terminal: true,
+    completed: true,
+    completionReason: 'empty-board',
+    stopReason: null,
+  });
+  assert.deepEqual(detectTerminalStatus({
+    state: { available: [{ type: 'pepper' }], tray: [], layerGraph: { hidden: [] } },
+    action: { reason: 'safety-stop', tile: null },
+  }), {
+    terminal: true,
+    completed: false,
+    completionReason: null,
+    stopReason: 'safety-stop',
+  });
+  assert.equal(detectTerminalStatus({
+    state: { available: [{ type: 'pepper' }], tray: [], layerGraph: { hidden: [] } },
+    action: { reason: 'reveal-most-promising', tile: { cx: 1, cy: 1 } },
+  }).terminal, false);
+  assert.equal(detectTerminalStatus({
+    screenReady: false,
+    state: { available: [], tray: [], layerGraph: { hidden: [] } },
+    action: { reason: 'no-action', tile: null },
+  }).terminal, false);
 
   const preservedState = {
     detected: [{ cx: 100, cy: 700, type: 'sun', typeSource: 'legacy-semantic' }],

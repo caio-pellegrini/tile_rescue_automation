@@ -115,6 +115,24 @@ function tileForLog(tile) {
   };
 }
 
+function screenLooksLikeTileRescue(image) {
+  if (!image?.data || !image.info?.width || !image.info?.height) return false;
+  const { data, info } = image;
+  const channels = info.channels;
+  const points = [0.2, 0.5, 0.8].map(ratio => [
+    Math.floor(info.width * ratio),
+    Math.floor(info.height * 0.13),
+  ]);
+  const tealPoints = points.filter(([x, y]) => {
+    const offset = (y * info.width + x) * channels;
+    const red = data[offset];
+    const green = data[offset + 1];
+    const blue = data[offset + 2];
+    return green - red >= 45 && green - blue >= 10 && green >= 100;
+  });
+  return tealPoints.length >= 2;
+}
+
 function buildPhaseMap(state) {
   const groups = new Map();
   const add = (tile, role) => {
@@ -207,6 +225,7 @@ async function analyze(image, options, clusters, classifier, packetDir) {
   await writeJson(path.join(packetDir, 'phase-map.json'), buildPhaseMap(state));
   const analysis = {
     capturedAt: new Date().toISOString(),
+    screenReady: screenLooksLikeTileRescue(image),
     state,
     action,
     stateSummary: stateForLog(state),
@@ -232,6 +251,7 @@ async function savePhase(image, analysis, phaseDir, phase, options) {
     level: options.level,
     state: analysis.state,
     action: analysis.action,
+    screenReady: analysis.screenReady,
     stateSummary: analysis.stateSummary,
   });
 }
@@ -253,6 +273,36 @@ function consoleSummary(move, options, analysis) {
       references: analysis.mlSummary.referenceCount,
       inferenceMs: analysis.mlSummary.inferenceMs,
     } : null,
+  };
+}
+
+function detectTerminalStatus(analysis) {
+  const state = analysis?.state || {};
+  const available = state.available || [];
+  const hidden = state.layerGraph?.hidden || [];
+  const tray = state.tray || [];
+  const screenReady = analysis.screenReady !== false;
+  if (screenReady && !available.length && !hidden.length && !tray.length) {
+    return {
+      terminal: true,
+      completed: true,
+      completionReason: 'empty-board',
+      stopReason: null,
+    };
+  }
+  if (analysis?.action?.reason === 'safety-stop') {
+    return {
+      terminal: true,
+      completed: false,
+      completionReason: null,
+      stopReason: 'safety-stop',
+    };
+  }
+  return {
+    terminal: false,
+    completed: false,
+    completionReason: null,
+    stopReason: null,
   };
 }
 
@@ -280,6 +330,9 @@ async function main() {
     mlEnabled: options.useMl,
     runDir,
     executedMoves: 0,
+    completed: false,
+    completionReason: null,
+    stopReason: null,
   };
   await writeJson(path.join(runDir, 'run.json'), run);
 
@@ -306,9 +359,21 @@ async function main() {
     await savePhase(image, analysis, phaseDir, 'before', options);
     console.log(JSON.stringify(consoleSummary(move, options, analysis)));
 
+    const terminal = detectTerminalStatus(analysis);
+    if (terminal.completed) {
+      run.completed = true;
+      run.completionReason = terminal.completionReason;
+      break;
+    }
+    if (terminal.stopReason) {
+      run.stopReason = terminal.stopReason;
+      break;
+    }
     if (!options.live) break;
-    if (!analysis.action?.tile) break;
-    if (analysis.action.reason === 'safety-stop') break;
+    if (!analysis.action?.tile) {
+      run.stopReason = 'no-action';
+      break;
+    }
 
     adb(options.device, [
       'shell',
@@ -331,6 +396,33 @@ async function main() {
       level: options.level,
       source: 'post-tap observation; analyzed as the next before frame',
     });
+
+    // Detect an empty board immediately after the tap, before loading the
+    // classifier for another full analysis. This is the authoritative
+    // completion signal for a cleared level.
+    const postTapState = summarize(
+      image,
+      require('./agent').connectedComponents(image),
+      clusters,
+    );
+    const postTapTerminal = detectTerminalStatus({
+      state: postTapState,
+      screenReady: screenLooksLikeTileRescue(image),
+    });
+    if (postTapTerminal.completed) {
+      run.completed = true;
+      run.completionReason = postTapTerminal.completionReason;
+      await writeJson(path.join(afterDir, 'after.json'), {
+        phase: 'after',
+        capturedAt: new Date().toISOString(),
+        device: options.device,
+        level: options.level,
+        source: 'post-tap observation; analyzed as the next before frame',
+        completed: true,
+        completionReason: postTapTerminal.completionReason,
+      });
+      break;
+    }
   }
 
   run.finishedAt = new Date().toISOString();
@@ -347,6 +439,7 @@ if (require.main === module) {
 
 module.exports = {
   buildPhaseMap,
+  detectTerminalStatus,
   parseArgs,
   stateForLog,
   tileForLog,

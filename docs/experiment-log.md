@@ -585,3 +585,21 @@ coordenada antiga ocorreu antes de essa situação ser percebida; como o
 tabuleiro já havia mudado, a coordenada atingiu outra carta. A regra operacional
 fica registrada: em execuções ao vivo, nunca repetir coordenadas; aguardar o
 processo terminar e consultar `run.json` e as capturas `move-XXX-before`.
+
+### Detecção explícita de conclusão do nível
+
+O runner passou a verificar, após cada toque, a condição de tabuleiro limpo:
+`available=0`, `hidden=0`, `tray=0` e nenhum componente detectado. Quando essa
+condição ocorre, o `run.json` registra `completed: true` e
+`completionReason: "empty-board"`, e `after.json` recebe a mesma evidência.
+
+Paradas por `safety-stop` ou ausência de ação agora ficam separadas em
+`stopReason`, evitando confundir uma parada segura com a conclusão do nível.
+Isso permite rodar com um limite alto de movimentos e encerrar assim que o
+tabuleiro for realmente limpo.
+
+Para evitar falso positivo em tela bloqueada, carregamento ou tela preta, a
+condição de conclusão também exige que a captura apresente o fundo teal do
+tabuleiro em pontos de referência do cabeçalho. A tela do aparelho foi
+encontrada bloqueada durante a preparação do nível 24; nenhuma execução ao
+vivo foi iniciada nesse estado.
