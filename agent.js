@@ -26,11 +26,10 @@ const RUN_LOG_DIR = process.env.RUN_LOG_DIR || path.join(
 // The playfield is everything between the level header and the tray. Keep
 // these bounds independent from the card layout: levels can arrange cards in
 // different rows and offsets, but the HUD/tray stay outside this region.
-// On the current 1080x2340 device layout the lowest board cards are centered
-// around y=1170; the tray and the empty area below it start later. Ending the
-// ROI at 1260 prevents the diagnostic layer scan from turning that empty area
-// into fake hidden cards while keeping the real bottom board layer.
-const BOARD_ROI = Object.freeze({ x0: 20, y0: 430, x1: 1060, y1: 1260 });
+// On the current 1080x2340 device layout, level 24 showed a lower board layer
+// extending to roughly y=1423. Keep the tray outside the ROI while including
+// these lower cards; the tray begins later around y=1600.
+const BOARD_ROI = Object.freeze({ x0: 20, y0: 430, x1: 1060, y1: 1480 });
 
 function adb(args, options = {}) {
   return execFileSync('adb', ['-s', DEVICE, ...args], {

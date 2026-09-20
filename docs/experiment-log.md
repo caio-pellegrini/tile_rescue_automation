@@ -5,7 +5,7 @@
 - Dispositivo de teste: Samsung conectado por ADB.
 - Resolução observada: `1080x2340`.
 - Região útil do tabuleiro: entre o header e a bandeja, aproximadamente
-  `x=20..1060`, `y=430..1260`.
+  `x=20..1060`, `y=430..1480`.
 - A bandeja ocupa uma região separada e tem sete posições sobrepostas.
 - O objetivo operacional é completar o nível; a contagem de sóis não é uma
   condição necessária.
@@ -603,3 +603,33 @@ condição de conclusão também exige que a captura apresente o fundo teal do
 tabuleiro em pontos de referência do cabeçalho. A tela do aparelho foi
 encontrada bloqueada durante a preparação do nível 24; nenhuma execução ao
 vivo foi iniciada nesse estado.
+
+### Desempenho observado no runner do nível 24
+
+Durante a execução real com `--moves 999`, o campo `mlSummary.inferenceMs`
+registrou aproximadamente 20,6–28,1 segundos por captura. O intervalo total
+entre capturas ficou em aproximadamente 30–36 segundos. O `settleMs` configurado
+é de apenas 1,2 segundo, portanto a inferência do modelo local em CPU é o
+principal consumidor conhecido.
+
+O runner ainda não mede separadamente captura, geração do pacote de visão,
+gravação dos artefatos, chamada ADB, espera pós-toque e `chooseAction()`. Depois
+da conclusão do nível 24, adicionar esses tempos por movimento e otimizar a
+inferência sem reduzir os critérios de segurança será a próxima melhoria
+prioritária.
+
+### Falso positivo de conclusão no nível 24 e correção do ROI
+
+O primeiro teste com `--moves 999` encerrou após 24 toques com
+`completed: true`, mas a captura `move-023-after/after.png` ainda mostrava
+três cartas na parte inferior. A análise manual confirmou que elas ocupavam
+aproximadamente `y=1292..1423`, fora do ROI antigo que terminava em `y=1260`.
+
+O `BOARD_ROI` foi ampliado para `y=1480`, ainda antes da bandeja, e a captura
+final será reanalisada antes de qualquer continuação. O nível 24 não deve ser
+considerado concluído pelo primeiro `run.json`; o motivo foi um falso positivo
+de detecção, não uma vitória real.
+
+Além de `available`, `hidden` e `tray`, a detecção agora exige
+`detected=0`. O replay da captura final passou a encontrar 3 cartas disponíveis
+em `y=1367` e 9 relações ocultas com o ROI corrigido.

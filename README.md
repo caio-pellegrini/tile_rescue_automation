@@ -40,7 +40,7 @@ revisar a recomendação.
   encoder a cada movimento.
 
 O tabuleiro é analisado por uma ROI contínua entre o header e a bandeja
-(`x=20..1060`, `y=430..1260` na captura `1080x2340`). O detector procura
+(`x=20..1060`, `y=430..1480` na captura `1080x2340`). O detector procura
 cartões nessa área, elimina candidatos sobrepostos e usa a bandeja como uma
 região separada; ele não depende mais de duas fileiras fixas.
 

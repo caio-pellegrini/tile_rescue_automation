@@ -56,6 +56,16 @@ async function load(path) {
     state: { available: [], tray: [], layerGraph: { hidden: [] } },
     action: { reason: 'no-action', tile: null },
   }).terminal, false);
+  assert.equal(detectTerminalStatus({
+    screenReady: true,
+    state: {
+      detected: [{ cx: 540, cy: 1367, type: 'unknown' }],
+      available: [],
+      tray: [],
+      layerGraph: { hidden: [] },
+    },
+    action: { reason: 'no-action', tile: null },
+  }).terminal, false);
 
   const preservedState = {
     detected: [{ cx: 100, cy: 700, type: 'sun', typeSource: 'legacy-semantic' }],

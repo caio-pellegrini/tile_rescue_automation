@@ -144,10 +144,10 @@ substitui silenciosamente a visão local.
 
 - A localização de cartas parcialmente cobertas ainda depende do detector
   geométrico; um recorte errado não pode ser corrigido apenas por classificação.
-- O ROI do tabuleiro foi delimitado até `y=1260` para o layout atual do
-  dispositivo, mantendo a camada inferior observada em torno de `y=1170` e
-  excluindo o fundo abaixo dela. Se a resolução ou escala do dispositivo mudar,
-  esse limite deve ser recalibrado.
+- O ROI do tabuleiro foi ampliado até `y=1480` depois que o nível 24 mostrou
+  cartas inferiores chegando a `y=1423`, mantendo a bandeja fora da região.
+  Se a resolução ou escala do dispositivo mudar, esse limite deve ser
+  recalibrado.
 - O classificador local atual usa embeddings visuais de CLIP quantizado em CPU;
   isso ajuda a agrupar ícones novos, mas não é uma segmentação perfeita de
   cartas parcialmente cobertas.

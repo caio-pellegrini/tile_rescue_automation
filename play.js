@@ -281,8 +281,9 @@ function detectTerminalStatus(analysis) {
   const available = state.available || [];
   const hidden = state.layerGraph?.hidden || [];
   const tray = state.tray || [];
+  const detected = state.detected || [];
   const screenReady = analysis.screenReady !== false;
-  if (screenReady && !available.length && !hidden.length && !tray.length) {
+  if (screenReady && !available.length && !hidden.length && !tray.length && !detected.length) {
     return {
       terminal: true,
       completed: true,

@@ -92,7 +92,7 @@ inglês e aceita várias imagens de referência para o mesmo ícone.
 A ROI atual para o tabuleiro é:
 
 ```text
-x=20..1060, y=430..1260  (captura observada de 1080x2340)
+x=20..1060, y=430..1480  (captura observada de 1080x2340)
 ```
 
 O header fica acima da ROI e a bandeja/controles ficam abaixo. Esse limite é
@@ -505,3 +505,29 @@ separadamente em `stopReason`.
 Antes de aceitar `empty-board`, o runner valida pontos do fundo teal do jogo
 na captura. Isso evita marcar como concluído um aparelho bloqueado, carregando
 ou com a tela apagada.
+
+## 14. Próxima melhoria: desempenho
+
+Na execução real do nível 24, `mlSummary.inferenceMs` ficou entre 20,6 e
+28,1 segundos por captura, enquanto o intervalo total entre capturas ficou em
+aproximadamente 30–36 segundos. O `settleMs` é 1,2 segundo; a inferência local
+em CPU é o principal gargalo conhecido.
+
+Ainda falta instrumentar separadamente captura, visão, escrita do pacote,
+ADB, espera pós-toque e planejador. Fazer essa medição após concluir o nível 24
+e só então otimizar a inferência, preservando os limiares e as máscaras seguras.
+
+## 15. Correção do ROI após falso positivo no nível 24
+
+O primeiro teste real com `--moves 999` parou após 24 toques com
+`completed: true`, mas `move-023-after/after.png` ainda mostrava três cartas
+inferiores. Elas ocupavam aproximadamente `y=1292..1423`, fora do ROI anterior
+que terminava em `y=1260`.
+
+O ROI foi corrigido para `y=1480`, mantendo a bandeja fora da região. O nível
+24 permanece incompleto até uma nova análise confirmar que não existem cartas
+visíveis ou ocultas. Não usar o `run.json` anterior como prova de conclusão.
+
+A condição de conclusão também exige `detected=0`, além de `available=0`,
+`hidden=0` e `tray=0`. O replay da captura encontrou as três cartas inferiores
+em `y=1367` após a correção.
