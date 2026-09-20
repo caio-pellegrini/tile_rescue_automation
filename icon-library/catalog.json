@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "icons": {
+    "blueberry": [
+      {
+        "file": "blueberry/board-0-397-715.png",
+        "sourcePacket": "/tmp/tile-rescue-current-packet-v3",
+        "sourceTile": "board-0-397-715",
+        "variant": null,
+        "addedAt": "2026-09-20T02:25:48.238Z"
+      },
+      {
+        "file": "blueberry/board-3-325-1168.png",
+        "sourcePacket": "/tmp/tile-rescue-current-packet-v3",
+        "sourceTile": "board-3-325-1168",
+        "variant": null,
+        "addedAt": "2026-09-20T02:25:48.244Z"
+      }
+    ],
+    "butterfly": [
+      {
+        "file": "butterfly/board-1-539-715.png",
+        "sourcePacket": "/tmp/tile-rescue-current-packet-v3",
+        "sourceTile": "board-1-539-715",
+        "variant": null,
+        "addedAt": "2026-09-20T02:25:48.245Z"
+      }
+    ],
+    "sun": [
+      {
+        "file": "sun/board-2-680-720.png",
+        "sourcePacket": "/tmp/tile-rescue-current-packet-v3",
+        "sourceTile": "board-2-680-720",
+        "variant": "collectible",
+        "addedAt": "2026-09-20T02:25:48.246Z",
+        "sourceImage": "/tmp/tile-rescue-current-packet-v4/crops/board-2-680-720.png"
+      },
+      {
+        "file": "sun/sun0.png",
+        "sourceImage": "/tmp/sun0.png",
+        "variant": "collectible",
+        "addedAt": "2026-09-20T02:30:21.109Z"
+      },
+      {
+        "file": "sun/sun1.png",
+        "sourceImage": "/tmp/sun1.png",
+        "variant": "partial",
+        "addedAt": "2026-09-20T02:30:21.184Z"
+      }
+    ],
+    "cake": [
+      {
+        "file": "cake/board-4-540-1177.png",
+        "sourcePacket": "/tmp/tile-rescue-current-packet-v3",
+        "sourceTile": "board-4-540-1177",
+        "variant": null,
+        "addedAt": "2026-09-20T02:25:48.247Z"
+      },
+      {
+        "file": "cake/board-5-754-1177.png",
+        "sourcePacket": "/tmp/tile-rescue-current-packet-v3",
+        "sourceTile": "board-5-754-1177",
+        "variant": null,
+        "addedAt": "2026-09-20T02:25:48.247Z"
+      }
+    ]
+  }
+}
