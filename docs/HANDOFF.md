@@ -517,6 +517,41 @@ Ainda falta instrumentar separadamente captura, visão, escrita do pacote,
 ADB, espera pós-toque e planejador. Fazer essa medição após concluir o nível 24
 e só então otimizar a inferência, preservando os limiares e as máscaras seguras.
 
+## 16. Retomada e conclusão real do nível 24
+
+O primeiro `--moves 999` do nível 24 teve um falso positivo porque o ROI antigo
+terminava em `y=1260`; essa execução não deve ser usada como evidência de
+conclusão. Depois do ROI corrigido para `y=1480`, a retomada foi auditada em
+`/tmp/tile-rescue-level24-live-complete-20260920` e registrou:
+
+- `executedMoves: 4`;
+- `completed: true`;
+- `completionReason: "empty-board"`;
+- `stopReason: null`.
+
+A captura `move-003-after/after.png` mostra a bandeja vazia e nenhum cartão no
+tabuleiro. O nível 24 foi concluído sem toques manuais.
+
+Durante a retomada foram corrigidos dois problemas de geometria e identidade:
+
+- os slots da bandeja deste layout usam centros espaçados em 120 px, não 107;
+  o passo incorreto deslocava progressivamente os recortes para a carta vizinha;
+- os recortes da bandeja agora usam uma janela menor e centralizada, e a
+  ocupação exige luz nos dois lados do slot. Isso rejeita a borda de uma carta
+  anterior como um novo slot vazio, sem perder o pimentão verde real.
+
+Também foi adicionado um caso conservador de promoção de grupo visual: pelo
+  menos duas cartas jogáveis do mesmo grupo desconhecido podem receber um nome
+  canônico somente quando há um exemplar nomeado confirmado no mesmo estado e
+  ambas têm a mesma alternativa semântica forte. Esse caso permitiu reconhecer
+  dois sóis na bandeja, que estavam abaixo de `0.88` por causa do recorte, e
+  completar a trinca sem reduzir globalmente o limiar.
+
+O aparelho bloqueou a tela durante uma tentativa intermediária; o runner
+  registrou `screenReady: false` e não considerou aquilo uma vitória. A tela foi
+  desbloqueada antes da retomada final. Em execuções longas, manter o aparelho
+  acordado ou verificar o bloqueio antes de iniciar continua sendo necessário.
+
 ## 15. Correção do ROI após falso positivo no nível 24
 
 O primeiro teste real com `--moves 999` parou após 24 toques com

@@ -633,3 +633,34 @@ de detecção, não uma vitória real.
 Além de `available`, `hidden` e `tray`, a detecção agora exige
 `detected=0`. O replay da captura final passou a encontrar 3 cartas disponíveis
 em `y=1367` e 9 relações ocultas com o ROI corrigido.
+
+### Retomada final do nível 24 — 2026-09-20
+
+Após o desbloqueio do aparelho, o runner foi retomado em modo ao vivo com
+`--moves 999`. A execução final está em
+`/tmp/tile-rescue-level24-live-complete-20260920` e terminou com quatro
+movimentos, `completed: true`, `completionReason: "empty-board"` e sem
+`stopReason`. A captura `move-003-after/after.png` confirma visualmente a
+bandeja vazia e o tabuleiro limpo.
+
+Dois erros encontrados durante a retomada foram corrigidos antes da execução
+final:
+
+1. O layout atual da bandeja usa centros `120, 240, 360, 480, 600...`. O
+   passo anterior de 107 px deslocava cada recorte e fazia o bolo/cupcake ser
+   lido junto com a carta anterior.
+2. A ocupação do slot passou a usar uma faixa central mais estreita e a exigir
+   evidência nos dois lados. Assim, a borda da última carta não cria um sexto
+   cartão falso, e os dois pimentões reais continuam detectáveis.
+
+Além disso, `applyVisionLabels()` agora pode promover um grupo visual
+desconhecido para um rótulo já confirmado no estado quando há pelo menos dois
+membros consistentes e alternativa semântica forte comum. O limiar nomeado de
+`0.88` não foi reduzido. Esse mecanismo reconheceu os dois sóis da bandeja que
+tinham ficado como `unknown` por causa do recorte, permitindo completar a
+trinca com segurança.
+
+Uma tentativa intermediária parou com `screenReady: false` porque o aparelho
+entrou na tela de bloqueio durante a inferência; ela não foi contada como
+conclusão. A execução final só começou depois da confirmação visual de que o
+nível 24 estava aberto e desbloqueado.

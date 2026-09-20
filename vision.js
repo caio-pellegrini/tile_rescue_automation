@@ -19,11 +19,18 @@ function planningKeyForTile(tile) {
 }
 
 function cropBox(tile, info) {
-  const maxLeft = Math.max(0, info.width - CARD_WIDTH);
-  const maxTop = Math.max(0, info.height - CARD_HEIGHT);
-  const left = Math.max(0, Math.min(maxLeft, Math.round(tile.cx - CARD_WIDTH / 2)));
-  const top = Math.max(0, Math.min(maxTop, Math.round(tile.cy - CARD_HEIGHT / 2)));
-  return { left, top, width: CARD_WIDTH, height: CARD_HEIGHT };
+  // Tray slots are narrower and packed edge-to-edge. Using the board card
+  // width here leaks the neighboring tray icons into the crop (especially
+  // when two adjacent cards have different labels). Keep enough of the card
+  // face for CLIP, but center the crop on the slot's own icon.
+  const isTray = tile.cy >= 1600;
+  const width = isTray ? 108 : CARD_WIDTH;
+  const height = isTray ? 140 : CARD_HEIGHT;
+  const maxLeft = Math.max(0, info.width - width);
+  const maxTop = Math.max(0, info.height - height);
+  const left = Math.max(0, Math.min(maxLeft, Math.round(tile.cx - width / 2)));
+  const top = Math.max(0, Math.min(maxTop, Math.round(tile.cy - height / 2)));
+  return { left, top, width, height };
 }
 
 function tileId(tile, index, role = tile.cy >= 1600 ? 'tray' : 'board') {
@@ -266,11 +273,52 @@ function applyVisionLabels(state, predictions, minimumConfidence = 0.75) {
     ...(state.tray || []),
   ].map(tile => `${tile.cx},${tile.cy}`));
   const unknownGroupCounts = new Map();
+  const playableNamedLabels = new Map();
   for (const prediction of allPredictions) {
-    if (prediction.referenceLabel || prediction.label !== 'unknown' || !prediction.groupId) continue;
     const center = centerFromId(prediction);
-    if (center && playableCenters.has(center)) {
+    if (!center || !playableCenters.has(center)) continue;
+    if (prediction.referenceLabel || prediction.label !== 'unknown') {
+      const label = prediction.referenceLabel || prediction.label;
+      const confidence = Number(prediction.confidence);
+      if (label && confidence >= 0.90) {
+        playableNamedLabels.set(label, Math.max(playableNamedLabels.get(label) || 0, confidence));
+      }
+      continue;
+    }
+    if (prediction.groupId) {
       unknownGroupCounts.set(prediction.groupId, (unknownGroupCounts.get(prediction.groupId) || 0) + 1);
+    }
+  }
+
+  // A tightly consistent unknown tray group can be named when the same
+  // semantic label is already confirmed elsewhere in the playable state.
+  // This handles packed tray crops whose icon is clear but whose CLIP score
+  // falls just below the global threshold. It remains conservative: at least
+  // two members, a strong common alternative, and a confirmed peer are all
+  // required. Hidden tiles are never promoted by this rule.
+  const promotedUnknownLabels = new Map();
+  for (const prediction of allPredictions) {
+    if (prediction.label !== 'unknown' || !prediction.groupId) continue;
+    const center = centerFromId(prediction);
+    if (!center || !playableCenters.has(center)) continue;
+    const candidate = (prediction.alternatives || [])
+      .filter(item => playableNamedLabels.has(item.label))
+      .sort((a, b) => Number(b.confidence) - Number(a.confidence))[0];
+    if (!candidate || Number(candidate.confidence) < 0.84) continue;
+    const next = promotedUnknownLabels.get(prediction.groupId) || {
+      label: candidate.label,
+      members: 0,
+      minimumConfidence: 1,
+    };
+    if (next.label !== candidate.label) continue;
+    next.members++;
+    next.minimumConfidence = Math.min(next.minimumConfidence, Number(candidate.confidence));
+    promotedUnknownLabels.set(prediction.groupId, next);
+  }
+  for (const [groupId, promotion] of promotedUnknownLabels) {
+    if ((unknownGroupCounts.get(groupId) || 0) < 2 ||
+      promotion.members < 2 || promotion.minimumConfidence < 0.84) {
+      promotedUnknownLabels.delete(groupId);
     }
   }
 
@@ -307,7 +355,11 @@ function applyVisionLabels(state, predictions, minimumConfidence = 0.75) {
       if (!prediction) continue;
       // groupId is local to the current screen and is what lets a new level
       // use completely different icons without relying on semantic names.
-      const namedLabel = prediction.referenceLabel || (prediction.label !== 'unknown' ? prediction.label : null);
+      const promotedLabel = prediction.label === 'unknown'
+        ? promotedUnknownLabels.get(prediction.groupId)?.label || null
+        : null;
+      const namedLabel = prediction.referenceLabel ||
+        (prediction.label !== 'unknown' ? prediction.label : promotedLabel);
       const existingType = tile.type && tile.type !== 'unknown' ? tile.type : null;
       const existingLegacySemantic = existingType && tile.typeSource === 'legacy-semantic';
       const namedConflict = Boolean(existingLegacySemantic && namedLabel && existingType !== namedLabel);
@@ -329,7 +381,11 @@ function applyVisionLabels(state, predictions, minimumConfidence = 0.75) {
         tile.groupId = prediction.groupId || prediction.label || null;
         tile.sessionGroupId = prediction.groupId || tile.sessionGroupId || null;
         tile.type = namedLabel;
-        tile.typeSource = prediction.referenceLabel ? 'local-reference' : 'local-ml';
+        tile.typeSource = prediction.referenceLabel
+          ? 'local-reference'
+          : promotedLabel
+            ? 'local-ml-group-promoted'
+            : 'local-ml';
       } else if (!tile.type || tile.type === 'unknown') {
         tile.groupId = prediction.groupId || prediction.label || null;
         tile.sessionGroupId = prediction.groupId || tile.sessionGroupId || null;

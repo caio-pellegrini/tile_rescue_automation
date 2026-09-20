@@ -288,13 +288,23 @@ function trayTiles(image) {
   const cy = 1740;
   // The tray is a fixed seven-slot strip on this device. Adjacent cards
   // overlap, so connected components are not a reliable way to count them.
+  // The current 1080px layout uses 120px slot centers; using the old 107px
+  // step progressively shifts crops into the neighboring card.
   for (let slot = 0; slot < 7; slot++) {
-    const cx = 120 + slot * 107;
+    const cx = 120 + slot * 120;
     let light = 0;
+    let leftLight = 0;
+    let rightLight = 0;
     for (let y = cy - 58; y <= cy + 58; y += 2) {
-      for (let x = cx - 48; x <= cx + 48; x += 2) {
+      // Adjacent tray cards overlap horizontally. Count the slot from its
+      // central face only; a wide scan mistakes the right edge of the prior
+      // card for a new card in the next empty slot.
+      for (let x = cx - 36; x <= cx + 36; x += 2) {
         const [r, g, b] = pixel(image, x, y);
-        if (isLightTilePixel(r, g, b)) light++;
+        if (!isLightTilePixel(r, g, b)) continue;
+        light++;
+        if (x < cx) leftLight++;
+        else rightLight++;
       }
     }
     // Downsampled scan: a real card has hundreds of light samples; the dark
@@ -302,7 +312,10 @@ function trayTiles(image) {
     // Blue/dark icons occupy less of the white face than pale icons such as
     // cake. The current threshold keeps empty dividers out while retaining a
     // real blueberry in the first slot.
-    if (light < 1000) continue;
+    // A neighboring card can still contribute light pixels on one side of
+    // an empty slot. Require both halves of the slot to contain the card
+    // face, preserving real green/dark icons while rejecting that edge.
+    if (light < 900 || Math.min(leftLight, rightLight) < 200) continue;
     out.push({
       x: cx - 60, y: cy - 66, w: 120, h: 133,
       area: light, cx, cy,
