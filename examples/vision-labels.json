@@ -1,0 +1,11 @@
+[
+  {
+    "id": "hidden-0-590-710",
+    "label": "cupcake",
+    "confidence": 0.91,
+    "alternatives": [
+      { "label": "corn", "confidence": 0.06 }
+    ],
+    "visibleFraction": 0.42
+  }
+]

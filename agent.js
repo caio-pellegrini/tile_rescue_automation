@@ -1,14 +1,31 @@
 const { execFileSync } = require('node:child_process');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 const sharp = require('sharp');
+const { applyVisionLabels, loadVisionLabels, writeVisionPacket } = require('./vision');
 
 const DEVICE = process.env.DEVICE || 'RQCY903RJQN';
 const LIVE = process.argv.includes('--live');
+const EXPORT_VISION = process.argv.includes('--export-vision');
+const VISION_LABELS_FILE = process.env.VISION_LABELS_FILE;
 const MAX_MOVES = Number(process.env.MAX_MOVES || (LIVE ? 1 : 0));
+const SAVE_FRAMES = LIVE || process.env.SAVE_FRAMES === '1';
+const LEVEL = process.env.LEVEL || '23';
+const RUN_LOG_DIR = process.env.RUN_LOG_DIR || path.join(
+  '/tmp',
+  'tile-rescue-runs',
+  `level-${LEVEL}`,
+  new Date().toISOString().replace(/[:.]/g, '-'),
+);
 
 // The playfield is everything between the level header and the tray. Keep
 // these bounds independent from the card layout: levels can arrange cards in
 // different rows and offsets, but the HUD/tray stay outside this region.
-const BOARD_ROI = Object.freeze({ x0: 20, y0: 430, x1: 1060, y1: 1450 });
+// On the current 1080x2340 device layout the lowest board cards are centered
+// around y=1170; the tray and the empty area below it start later. Ending the
+// ROI at 1260 prevents the diagnostic layer scan from turning that empty area
+// into fake hidden cards while keeping the real bottom board layer.
+const BOARD_ROI = Object.freeze({ x0: 20, y0: 430, x1: 1060, y1: 1260 });
 
 function adb(args, options = {}) {
   return execFileSync('adb', ['-s', DEVICE, ...args], {
@@ -19,6 +36,31 @@ function adb(args, options = {}) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function analyzeImage(image, clusters) {
+  const components = connectedComponents(image);
+  const state = summarize(image, components, clusters);
+  if (VISION_LABELS_FILE) {
+    const labels = await loadVisionLabels(VISION_LABELS_FILE);
+    const result = applyVisionLabels(state, labels, Number(process.env.VISION_MIN_CONFIDENCE || 0.75));
+    console.error(`vision labels applied: ${result.applied}`);
+  }
+  return { state, action: chooseAction(state) };
+}
+
+async function saveRunFrame(image, state, action, phase, runDir) {
+  const imagePath = path.join(runDir, `${phase}.png`);
+  const metadataPath = path.join(runDir, `${phase}.json`);
+  await sharp(image.data, { raw: image.info }).png().toFile(imagePath);
+  await fs.writeFile(metadataPath, `${JSON.stringify({
+    phase,
+    capturedAt: new Date().toISOString(),
+    device: DEVICE,
+    level: LEVEL,
+    state,
+    action,
+  }, null, 2)}\n`);
 }
 
 async function capture() {
@@ -42,7 +84,17 @@ function isLightTilePixel(r, g, b) {
   return light || yellow;
 }
 
-function connectedComponents(image, roi = BOARD_ROI) {
+function isNeutralCardPixel(r, g, b) {
+  const hi = Math.max(r, g, b);
+  const lo = Math.min(r, g, b);
+  return hi > 200 && lo > 155 && hi - lo < 80;
+}
+
+function isCollectibleGoldPixel(r, g, b) {
+  return r > 135 && g > 105 && b < 115 && r > b * 1.35 && g > b * 1.15;
+}
+
+function connectedComponents(image, roi = BOARD_ROI, predicate = isLightTilePixel) {
   const { data, info } = image;
   roi = {
     x0: Math.max(0, roi.x0),
@@ -59,7 +111,7 @@ function connectedComponents(image, roi = BOARD_ROI) {
   for (let y = roi.y0; y < roi.y1; y++) {
     for (let x = roi.x0; x < roi.x1; x++) {
       const i = (y * info.width + x) * info.channels;
-      if (isLightTilePixel(data[i], data[i + 1], data[i + 2])) {
+      if (predicate(data[i], data[i + 1], data[i + 2])) {
         mask[(y - roi.y0) * rw + (x - roi.x0)] = 1;
       }
     }
@@ -152,12 +204,18 @@ function descriptor(image, cx, cy) {
 function semanticType(signature) {
   if (!signature) return 'unknown';
   const [, red, orange, pale, green, blue, pink] = signature;
-  if (orange > 0.75) return 'sun';
+  // A chick and a sun share the same yellow/orange palette. The chick crop
+  // contains the eyes/beak as a small dark population; check that before the
+  // broad orange=>sun rule.
+  if (orange > 0.70 && signature[0] > 0.012) return 'chick';
+  if (orange > 0.70) return 'sun';
   if (green > 0.25) return 'corn';
   if (green > 0.02 && green < 0.25 && blue + pink < 0.03) return 'carrot';
   if (blue + pink > 0.03 && orange > 0.20) return 'cupcake';
-  if (orange > 0.45 && orange < 0.75 && green < 0.02 && blue + pink < 0.03) return 'chick';
-  if (blue > 0.15) return 'whale';
+  // Do not classify a weaker orange sun as a chick. The tray can change the
+  // orange ratio slightly because cards overlap; a chick still needs the dark
+  // eyes/beak evidence above this rule.
+  if (orange > 0.45 && orange < 0.75 && signature[0] > 0.012 && green < 0.02 && blue + pink < 0.03) return 'chick';
   return 'unknown';
 }
 
@@ -172,12 +230,15 @@ function assignTypes(tiles, clusters = []) {
   for (const tile of tiles) {
     if (!tile.signature) {
       tile.type = 'unknown';
+      tile.typeSource = 'unknown';
       tile.typeDistance = Infinity;
       continue;
     }
     const semantic = semanticType(tile.signature);
     if (semantic !== 'unknown') {
       tile.type = semantic;
+      tile.groupId = semantic;
+      tile.typeSource = 'legacy-semantic';
       tile.typeDistance = 0;
       continue;
     }
@@ -186,16 +247,22 @@ function assignTypes(tiles, clusters = []) {
       const d = distance(tile.signature, cluster.prototype);
       if (!best || d < best.d) best = { cluster, d };
     }
-    // Empirical margin from board-to-tray scale changes on this device. A
-    // larger distance stays a new visual class instead of guessing a match.
-    if (best && best.d < 0.24) {
-      tile.type = best.cluster.id;
+    // Color signatures are only a conservative fallback. A broad threshold
+    // incorrectly merged the blue blueberry with the purple butterfly on the
+    // current level, so keep the margin tight and let the named local ML
+    // library handle new icons whenever it is available.
+    if (best && best.d < 0.10) {
+      tile.type = 'unknown';
+      tile.groupId = best.cluster.id;
+      tile.typeSource = 'visual-cluster';
       tile.typeDistance = Number(best.d.toFixed(4));
       best.cluster.prototype = best.cluster.prototype.map((v, i) => v * 0.85 + tile.signature[i] * 0.15);
     } else {
-      const cluster = { id: `tile-${clusters.length}`, prototype: tile.signature, members: [tile] };
+      const cluster = { id: `visual-group-${clusters.length + 1}`, prototype: tile.signature, members: [tile] };
       clusters.push(cluster);
-      tile.type = cluster.id;
+      tile.type = 'unknown';
+      tile.groupId = cluster.id;
+      tile.typeSource = 'visual-cluster';
       tile.typeDistance = 0;
     }
   }
@@ -218,7 +285,10 @@ function trayTiles(image) {
     }
     // Downsampled scan: a real card has hundreds of light samples; the dark
     // tray background and empty dividers do not.
-    if (light < 1500) continue;
+    // Blue/dark icons occupy less of the white face than pale icons such as
+    // cake. The current threshold keeps empty dividers out while retaining a
+    // real blueberry in the first slot.
+    if (light < 1000) continue;
     out.push({
       x: cx - 60, y: cy - 66, w: 120, h: 133,
       area: light, cx, cy,
@@ -226,6 +296,27 @@ function trayTiles(image) {
     });
   }
   return out;
+}
+
+function cardVariant(image, cx, cy) {
+  const patches = [
+    [-50, -50], [50, -50],
+    [-50, 50], [50, 50],
+  ];
+  let gold = 0;
+  let neutral = 0;
+  for (const [ox, oy] of patches) {
+    for (let y = cy + oy - 10; y <= cy + oy + 10; y += 3) {
+      for (let x = cx + ox - 10; x <= cx + ox + 10; x += 3) {
+        const [r, g, b] = pixel(image, x, y);
+        if (isCollectibleGoldPixel(r, g, b)) gold++;
+        if (isNeutralCardPixel(r, g, b)) neutral++;
+      }
+    }
+  }
+  const total = gold + neutral;
+  if (total < 20) return 'unknown';
+  return gold / total > 0.45 ? 'collectible' : 'normal';
 }
 
 function boardCardScore(image, cx, cy) {
@@ -303,10 +394,143 @@ function boardAreaTiles(image, components = []) {
       cx: candidate.cx,
       cy: candidate.cy,
       signature,
+      variant: cardVariant(image, candidate.cx, candidate.cy),
     });
   }
 
+  // Gold cards are valid sun cards, but a diagonal overlap with a neutral
+  // card is strong evidence that the gold card is underneath it. The old
+  // color-only detector promoted those cards to `available`, creating the
+  // false extra sun seen on level 23.
+  for (const tile of out) {
+    if (tile.variant !== 'collectible') continue;
+    const cover = out.find(other => {
+      if (other === tile || other.variant !== 'normal') return false;
+      const dx = Math.abs(other.cx - tile.cx);
+      const dy = Math.abs(other.cy - tile.cy);
+      if (dx < 35 || dy < 35 || dx >= 190 || dy >= 190) return false;
+      const overlapWidth = Math.max(0, 190 - dx);
+      const overlapHeight = Math.max(0, 190 - dy);
+      return (overlapWidth * overlapHeight) / (190 * 190) >= 0.04;
+    });
+    if (cover) {
+      tile.playable = false;
+      tile.occludedBy = { cx: cover.cx, cy: cover.cy };
+    }
+  }
+
+  return out
+    .filter(tile => tile.playable !== false)
+    .sort((a, b) => a.cy - b.cy || a.cx - b.cx);
+}
+
+// Diagnostic layer detector. Unlike boardAreaTiles(), this deliberately keeps
+// partially exposed faces and does not require a matching tray type. It is not
+// used to click yet; its job is to expose the complete layer hypothesis to a
+// visual classifier and make false geometry visible during validation.
+function boardLayerCandidates(image, threshold = 0.38) {
+  const candidates = [];
+  for (let cy = BOARD_ROI.y0 + 35; cy <= BOARD_ROI.y1 - 35; cy += 10) {
+    for (let cx = BOARD_ROI.x0 + 70; cx <= BOARD_ROI.x1 - 70; cx += 10) {
+      const visibility = boardCardScore(image, cx, cy);
+      if (visibility < threshold) continue;
+      candidates.push({ cx, cy, visibility });
+    }
+  }
+
+  candidates.sort((a, b) => b.visibility - a.visibility);
+  const out = [];
+  for (const candidate of candidates) {
+    if (out.some(prev => Math.hypot(prev.cx - candidate.cx, prev.cy - candidate.cy) < 85)) continue;
+    const signature = descriptor(image, candidate.cx, candidate.cy);
+    if (!signature) continue;
+    out.push({
+      x: candidate.cx - 71,
+      y: candidate.cy - 80,
+      w: 142,
+      h: 160,
+      cx: candidate.cx,
+      cy: candidate.cy,
+      visibility: Number(candidate.visibility.toFixed(3)),
+      signature,
+      variant: cardVariant(image, candidate.cx, candidate.cy),
+    });
+  }
   return out.sort((a, b) => a.cy - b.cy || a.cx - b.cx);
+}
+
+function layerOverlapRatio(a, b) {
+  const overlapWidth = Math.max(0, 190 - Math.abs(a.cx - b.cx));
+  const overlapHeight = Math.max(0, 190 - Math.abs(a.cy - b.cy));
+  return (overlapWidth * overlapHeight) / (190 * 190);
+}
+
+function buildLayerGraph(image, available) {
+  const candidates = boardLayerCandidates(image);
+  const hidden = candidates.filter(candidate =>
+    !available.some(tile => Math.hypot(tile.cx - candidate.cx, tile.cy - candidate.cy) < 55));
+  const hiddenKeys = new Set(hidden.map(tile => `${tile.cx},${tile.cy}`));
+  const edges = [];
+  for (const a of candidates) {
+    for (const b of candidates) {
+      if (a === b) continue;
+      // A relation must point to a genuinely hidden candidate. Without this
+      // guard, the coarse diagnostic scan creates duplicate edges to a second
+      // point near an already available card.
+      if (!hiddenKeys.has(`${b.cx},${b.cy}`)) continue;
+      const overlap = layerOverlapRatio(a, b);
+      // Tiny corner intersections are common between neighboring cards but do
+      // not provide enough evidence that one card covers another.
+      if (overlap < 0.12) continue;
+      // A fully exposed/neutral face is generally the cover when it overlaps
+      // a gold or weakly exposed face. Keep the relation probabilistic: this
+      // graph is a hypothesis for the classifier, not a click authorization.
+      const scoreA = a.visibility + (a.variant === 'normal' ? 0.05 : 0);
+      const scoreB = b.visibility + (b.variant === 'normal' ? 0.05 : 0);
+      const cover = scoreA >= scoreB ? a : b;
+      const target = cover === a ? b : a;
+      if (cover.visibility - target.visibility < 0.02 && cover.variant === target.variant) continue;
+      const confidence = Number(Math.min(0.99, overlap * 1.5 + Math.max(0, scoreA - scoreB)).toFixed(3));
+      if (confidence < 0.35) continue;
+      edges.push({
+        cover: { cx: cover.cx, cy: cover.cy },
+        target: { cx: target.cx, cy: target.cy, visibility: target.visibility, variant: target.variant },
+        relation: 'likely-covers',
+        overlap: Number(overlap.toFixed(3)),
+        confidence,
+      });
+    }
+  }
+  const uniqueEdges = edges.filter((edge, index) => {
+    const duplicate = edges.slice(0, index).some(previous =>
+      previous.cover.cx === edge.target.cx && previous.cover.cy === edge.target.cy &&
+      previous.target.cx === edge.cover.cx && previous.target.cy === edge.cover.cy);
+    return !duplicate;
+  });
+  // A partially visible card can overlap several neighbors. Keep only the two
+  // strongest explanations per target so the graph remains useful for
+  // validation instead of becoming a dense mesh of speculative relations.
+  const rankedByTarget = new Map();
+  for (const edge of uniqueEdges) {
+    const key = `${edge.target.cx},${edge.target.cy}`;
+    if (!rankedByTarget.has(key)) rankedByTarget.set(key, []);
+    rankedByTarget.get(key).push(edge);
+  }
+  const validatedEdges = [];
+  for (const group of rankedByTarget.values()) {
+    group.sort((a, b) => b.confidence - a.confidence || b.overlap - a.overlap);
+    validatedEdges.push(...group.slice(0, 2));
+  }
+  return {
+    nodes: candidates.map(tile => ({
+      cx: tile.cx,
+      cy: tile.cy,
+      visibility: tile.visibility,
+      variant: tile.variant,
+    })),
+    hidden,
+    edges: validatedEdges,
+  };
 }
 
 function cardRectsOverlap(a, b) {
@@ -423,13 +647,19 @@ function dedupeTiles(tiles) {
 }
 
 function summarize(image, components, clusters) {
+  // White card faces can be merged with yellow components. Add a second seed
+  // pass so a foreground chick/cupcake remains detectable when it overlaps a
+  // collectible gold card.
+  const neutralComponents = connectedComponents(image, BOARD_ROI, isNeutralCardPixel);
+  const allComponents = components.concat(neutralComponents);
   const componentTiles = components
     .map(c => ({ ...c, signature: descriptor(image, c.cx, c.cy) }));
-  const exposed = boardAreaTiles(image, components);
+  const exposed = boardAreaTiles(image, allComponents);
   const boardTiles = dedupeTiles(exposed.concat(componentTiles));
   const tiles = boardTiles.concat(trayTiles(image));
   assignTypes(tiles, clusters);
   const available = exposed;
+  const layerGraph = buildLayerGraph(image, available);
   // Exposed slots were included in `tiles`, so their assigned type is now
   // available; using these references avoids accidentally treating a hidden
   // component as playable.
@@ -446,6 +676,10 @@ function summarize(image, components, clusters) {
     detected: tiles.map(({ signature, ...t }) => t),
     available: available.map(({ signature, ...t }) => t),
     tray: tray.map(({ signature, ...t }) => t),
+    layerGraph: {
+      ...layerGraph,
+      hidden: layerGraph.hidden.map(({ signature, ...t }) => t),
+    },
     occlusionGraph,
     trayCounts,
     visibleCounts,
@@ -461,6 +695,7 @@ function chooseAction(state) {
   const counts = state.trayCounts;
   const byType = new Map();
   for (const tile of state.available) {
+    if (!tile.type || tile.type === 'unknown') continue;
     if (!byType.has(tile.type)) byType.set(tile.type, []);
     byType.get(tile.type).push(tile);
   }
@@ -509,8 +744,24 @@ function chooseAction(state) {
       : { reason: 'no-action', targetTypes: blockedGroups, tile: null };
   }
 
-  // Second priority: never choose an unrelated piece when a visible copy can
-  // extend a group already in the tray.
+  // A single card in the tray plus two exposed copies is already a complete
+  // triple opportunity. This must beat a generic pair extension and also beat
+  // starting an unrelated group.
+  const trayTripleGroups = [...byType.entries()]
+    .filter(([type, tiles]) => (counts[type] || 0) === 1 && tiles.length >= 2)
+    .sort((a, b) => b[1].length - a[1].length);
+  if (trayTripleGroups.length) {
+    const [type, tiles] = trayTripleGroups[0];
+    return {
+      reason: 'complete-triple-potential',
+      targetType: type,
+      availableCount: tiles.length,
+      tile: tiles[0],
+    };
+  }
+
+  // A single-card tray group with one exposed copy is useful, but it is only
+  // a pair extension and therefore comes after all visible triple options.
   for (const [type, tiles] of byType) {
     if ((counts[type] || 0) >= 1 && tiles.length >= 1) {
       return { reason: 'make-pair-with-tray', tile: tiles[0] };
@@ -524,7 +775,13 @@ function chooseAction(state) {
     .filter(([type, tiles]) => (counts[type] || 0) === 0 && tiles.length >= 2)
     .sort((a, b) => b[1].length - a[1].length);
   if (exposedGroups.length) {
-    return { reason: 'start-exposed-pair', tile: exposedGroups[0][1][0] };
+    const [type, tiles] = exposedGroups[0];
+    return {
+      reason: tiles.length >= 3 ? 'start-exposed-triple' : 'start-exposed-pair',
+      targetType: type,
+      availableCount: tiles.length,
+      tile: tiles[0],
+    };
   }
 
   // Never fill the final tray slot without a direct match.
@@ -533,6 +790,7 @@ function chooseAction(state) {
   // Exploratory action: choose the exposed type seen most often on the board.
   let chosen = null;
   for (const tile of state.available) {
+    if (!tile.type || tile.type === 'unknown') continue;
     const score = state.visibleCounts[tile.type] || 0;
     if (!chosen || score > chosen.score) chosen = { tile, score };
   }
@@ -542,17 +800,41 @@ function chooseAction(state) {
 async function main() {
   let moves = 0;
   const clusters = [];
+  let runDir = null;
+  if (SAVE_FRAMES) {
+    runDir = RUN_LOG_DIR;
+    await fs.mkdir(runDir, { recursive: true });
+    await fs.writeFile(path.join(runDir, 'run.json'), `${JSON.stringify({
+      startedAt: new Date().toISOString(),
+      device: DEVICE,
+      level: LEVEL,
+      live: LIVE,
+      maxMoves: MAX_MOVES,
+      visionLabelsFile: VISION_LABELS_FILE || null,
+    }, null, 2)}\n`);
+    console.error(`run frames: ${runDir}`);
+  }
   while (true) {
     const image = await capture();
-    const components = connectedComponents(image);
-    const state = summarize(image, components, clusters);
-    const action = chooseAction(state);
+    const { state, action } = await analyzeImage(image, clusters);
+    if (runDir) await saveRunFrame(image, state, action, `move-${String(moves).padStart(3, '0')}-before`, runDir);
+    if (EXPORT_VISION || process.env.VISION_PACKET_DIR) {
+      const outputDir = process.env.VISION_PACKET_DIR || path.resolve('vision-packet');
+      const packet = await writeVisionPacket(image, state, outputDir);
+      console.error(`vision packet written to ${packet.outputDir}`);
+    }
     console.log(JSON.stringify({ device: DEVICE, live: LIVE, moves, state, action }, null, 2));
 
-    if (!LIVE || moves >= MAX_MOVES || !action.tile) break;
+    if (EXPORT_VISION || !LIVE || moves >= MAX_MOVES || !action.tile) break;
     adb(['shell', 'input', 'tap', String(action.tile.cx), String(action.tile.cy)]);
     moves++;
     await sleep(900);
+
+    if (runDir) {
+      const afterImage = await capture();
+      const after = await analyzeImage(afterImage, clusters);
+      await saveRunFrame(afterImage, after.state, after.action, `move-${String(moves - 1).padStart(3, '0')}-after`, runDir);
+    }
   }
 }
 
@@ -565,7 +847,11 @@ module.exports = {
   distance,
   connectedComponents,
   boardAreaTiles,
+  boardLayerCandidates,
+  buildLayerGraph,
+  cardVariant,
   buildOcclusionGraph,
   summarize,
   chooseAction,
+  semanticType,
 };
