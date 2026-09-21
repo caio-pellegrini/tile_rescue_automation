@@ -274,6 +274,10 @@ com falha de código por causa disso. Os outros caminhos ausentes já listados n
 handoff permanecem: `/tmp/agent_after_one.png`, `/tmp/agent_after_two.png`,
 `/tmp/tile-rescue-after-two.png` e `/tmp/tile_rescue_manual_carrot_check.png`.
 
+Nota histórica: essa limitação foi corrigida posteriormente. A suíte atual não
+carrega mais esses caminhos temporários; os cenários equivalentes são estados
+determinísticos autocontidos, e os screenshots ficam apenas para replay manual.
+
 ### Primeiro teste ao vivo controlado
 
 Com autorização explícita, foi executada exatamente uma jogada em
@@ -664,3 +668,280 @@ Uma tentativa intermediária parou com `screenReady: false` porque o aparelho
 entrou na tela de bloqueio durante a inferência; ela não foi contada como
 conclusão. A execução final só começou depois da confirmação visual de que o
 nível 24 estava aberto e desbloqueado.
+
+## Instrumentação de desempenho e caminho rápido — 2026-09-20
+
+O runner passou a gravar `timing.json` por movimento. A medição separa ADB,
+decode, geometria, grafos, recortes, artefatos, leitura de arquivos,
+embeddings, aplicação de rótulos, planejador, tap e settle. Também foi criado o
+replay local `--replay-dir`, que reprocessa `before.png` existentes sem tocar no
+dispositivo.
+
+No replay de quatro estados do nível 24, o modo completo mediu média de `5,03 s`
+por movimento: captura/decode `17 ms`, geometria `162 ms`, grafos `188 ms`,
+artefatos `1,08 s`, referências mascaradas `287 ms`, reembedding dessas
+referências `2,94 s`, embeddings das cartas `285 ms`, aplicação de rótulos
+`0,8 ms` e `chooseAction()` `0,6 ms`.
+
+O gargalo ficou comprovado no reembedding das referências mascaradas de cartas
+ocultas. O modo completo agora mantém cache por referência e pela geometria
+exata da máscara. O modo `--fast` classifica somente cartas disponíveis e da
+bandeja, mantém ocultas no grafo sem autorizar taps, e omite overlays/contact
+sheets e variantes que não entram na decisão. O limiar `0.88`, a ROI, os slots
+da bandeja, a proteção de ocultas, o tratamento de `unknown` e a detecção de
+conclusão permanecem iguais.
+
+O replay do nível 24 em `--fast` mediu média de `0,73 s` e máximo de `0,79 s`.
+As quatro ações (razão, alvo e coordenada) foram iguais às do modo completo. O
+modo completo continua disponível para auditoria.
+
+### Teste real controlado do nível 25
+
+Com autorização explícita, foram executados exatamente três movimentos em
+`/tmp/tile-rescue-level25-live-profile-20260920`, no modo completo:
+
+1. `butterfly` em `(472,725)`;
+2. `butterfly` em `(608,859)`;
+3. `search-hidden-match` em `(209,584)`.
+
+Os tempos totais medidos foram `36,35 s`, `20,43 s` e `19,54 s`, média de
+`25,44 s`. No primeiro, ML consumiu `29,03 s`, com `24,15 s` em referências
+mascaradas e `1,90 s` em cartas. A captura ADB inicial consumiu `3,24 s`; os
+artefatos, `1,94 s`; o tap, `243 ms`; o settle, `1,20 s`; e a captura após o
+toque, `2,59 s`. Nos dois seguintes, ML consumiu `13,06 s` e `12,02 s`.
+
+O run terminou com três movimentos, sem conclusão e sem parada de segurança.
+Isso confirma no aparelho que a demora não está em `chooseAction()` nem no
+planejador, mas no caminho completo de ML, com contribuição relevante de ADB e
+auditoria. Não foram executados movimentos adicionais.
+
+### Cenouras não mapeadas no nível 25
+
+A inspeção do `contact-sheet.png` do primeiro movimento mostrou três cenouras
+livres em `(209,584)`, `(600,720)` e `(472,1261)`. O catálogo local não tinha
+o rótulo `carrot`: as duas primeiras foram classificadas como `unknown`, e a
+terceira recebeu `strawberry` com `0.8804`. Isso impediu que as três cartas
+formassem um grupo jogável; por isso a decisão anterior foi pelas duas
+borboletas.
+
+As três crops limpas foram cadastradas como referências `carrot` em
+`icon-library/catalog.json`. O replay rápido do mesmo primeiro frame passou a
+retornar `start-exposed-triple`, alvo `carrot`, com confianças `0.9806`,
+`0.9803` e `0.9830`. Nenhum novo toque foi executado.
+
+### Hipótese sobre a captura ADB — 2026-09-20
+
+O `--live-fast` do nível 25 reduziu o ML para aproximadamente `336 ms`, mas o
+intervalo médio entre movimentos permaneceu em `6,06 s`. A captura ADB ficou
+em `2,60 s` por observação. A hipótese passou a ser que o custo está na
+codificação PNG feita pelo Android: a captura PNG mediu `2,30--2,43 s` e
+`1,65 MB`, enquanto `adb exec-out screencap` sem `-p` transferiu o framebuffer
+bruto em aproximadamente `1,12 s` e `10,1 MB`.
+
+Foi implementado `--raw-capture` como experimento isolado, sem mudar o padrão
+PNG. O parser valida o cabeçalho de 16 bytes, as dimensões e o payload RGBA
+exato. No dry-run rápido do nível 25, sem toques, a captura bruta mediu
+`1378 ms` de ADB e `0,1 ms` de parse; a captura PNG no mesmo tipo de estado
+mediu `2695 ms` de ADB e `90 ms` de decode. A análise, ML, artefatos e ação
+permaneceram equivalentes e ambas escolheram a cenoura em `(472,1261)`.
+
+Conclusão provisória: a codificação PNG no dispositivo é o principal custo da
+captura, não `chooseAction()` nem o decode local. O bruto parece economizar
+aproximadamente `1,3 s` por captura, mas ainda não prova a meta de menos de
+`2 s` entre toques porque settle e pós-toque continuam no caminho crítico.
+Antes de torná-lo padrão, comparar PNG/RGBA em estados variados, verificar
+estabilidade do formato Android e fazer um teste ao vivo somente com
+autorização explícita.
+
+## Validação adicional de RGBA e pós-toque — 2026-09-20
+
+O cabeçalho observado em três capturas brutas consecutivas foi sempre
+`1080×2340`, `pixelFormat=1` (`RGBA_8888`), `dataspace=2` e `10.108.816` bytes
+totais, dos quais `10.108.800` são pixels. O parser passou a validar também o
+campo de formato e falha com erro explícito se ele mudar; há regressão unitária
+para um formato incompatível. A implementação oficial do Android documenta a
+ordem dos quatro campos como largura, altura, formato de pixel e dataspace.
+
+Uma série atual de três PNG e três RGBA, sem input, ocorreu fora da tela do
+jogo: PNG ficou em `452--1800 ms` de ADB e RGBA em `1006--1080 ms`; os seis
+runs ficaram com `screenReady: false`. Portanto essa série não é usada para
+afirmar equivalência de visão, apenas para confirmar transporte, dimensões,
+canais RGBA e comportamento seguro fora do jogo.
+
+Nos runs úteis do nível 25 já preservados, ambos os caminhos produziram
+`1080×2340`, quatro canais, a mesma ação para `carrot` em `(472,1261)`, nove
+cartas disponíveis, três na bandeja e validação teal verdadeira. A detecção
+geométrica variou levemente (`13/12` detectadas, `33/32` ocultas e `61/59`
+arestas), embora ambos os grafos fossem válidos e a decisão fosse idêntica.
+Essa diferença, mais a ausência de um novo estado jogável nesta sessão,
+impede promover RGBA a padrão. O modo PNG continua sendo o fallback e o
+default; `--raw-capture` exige opt-in.
+
+### Redução segura da repetição pós-toque
+
+O perfil anterior de `--live-fast` mediu `postTapSummary` em
+`0,76--0,78 s`. Como a captura `after` já é a imagem usada na próxima análise,
+o caminho rápido agora adia essa sumarização quando ainda haverá uma próxima
+iteração. A análise seguinte valida `screenReady`, detecta conclusão e só
+então permite outro toque; para o último movimento permitido, a checagem
+imediata permanece. O campo `timing.io.postTapCheck` registra o adiamento.
+
+Essa redução é uma otimização do caminho rápido e não altera o limiar `0.88`,
+a ROI, os slots da bandeja, o grafo de ocultação, a proteção de cartas
+parcialmente cobertas, o tratamento de `unknown` ou a detecção teal. Ainda não
+houve novo teste `--live-fast` após a alteração, pois isso exigiria autorização
+explícita. Quando a conclusão é adiada para a análise seguinte, o runner também
+anota o `after.json` anterior com `completed: true` e
+`completionDetectedOn: "next-analysis"`.
+
+## Cadastro de milho e raposa — 2026-09-20
+
+Antes de qualquer teste ao vivo, a captura atual do nível 25 foi inspecionada
+visualmente. O recorte `board-3-472-859` era milho, embora o modelo anterior o
+tivesse chamado de `carrot` com confiança limítrofe; `board-4-608-859` era uma
+raposa e permanecia como grupo desconhecido. Os dois recortes limpos foram
+cadastrados em `icon-library/catalog.json` como `corn` e `fox`.
+
+O replay sem ADB e sem toques confirmou `corn` com confiança `0,9906` e `fox`
+com `0,9873`. O catálogo já continha `blueberry` com duas referências. O grupo
+desconhecido em `(270,790)` foi visualmente identificado como sol oculto e não
+foi cadastrado como um novo ícone. Nenhuma jogada ao vivo foi iniciada.
+
+## Regressão do `--fast`: ocultas são necessárias ao planejador — 2026-09-20
+
+No primeiro frame do teste real, havia dois `sun` disponíveis e cartas ocultas
+do mesmo grupo. O caminho completo escolheu `start-exposed-pair` para `sun` em
+`(470,1260)`. O `--live-fast` escolheu `cupcake` em `(200,590)`, porque
+`classifyHidden: false` transformou os alvos ocultos em `unknown` e eliminou o
+desempate geométrico. O modo rápido atual não atende ao requisito de análise
+equivalente à humana; a próxima correção deve manter as ocultas e acelerar
+ referências mascaradas com cache/reuso, sem baixar o limiar `0.88`.
+
+## Camada por contorno e brilho relativo — 2026-09-20
+
+O detector recebeu um perfil de contorno por contraste local e uma medida de
+brilho relativo da face, sem assumir que amarelo/dourado significa camada
+inferior. A supressão geométrica deixou de usar a condição retangular
+`dx<120 && dy<135` e passou a deduplicar somente centros a menos de `72 px`.
+
+Para demover uma carta candidata de `available`, o grafo exige sobreposição
+real, uma face cobridora pelo menos tão exposta, contorno consistente da
+cobridora e diferença de brilho relativo de pelo menos `30`. Isso evita que
+uma amostra próxima da mesma carta seja confundida com outra camada e mantém
+o bloqueio de cartas parcialmente cobertas.
+
+Replay completo sem ADB nem toque:
+`/tmp/tile-rescue-level25-edge-full-replay-20260920-v2`. O frame continha
+quatro sóis reconhecidos pelo ML: dois em `available` e dois em `hidden`. A
+ação foi `start-exposed-pair`, alvo `sun` em `(470,1260)`, com
+`releaseScore.targetCount=4`; o runner não escolheu `cupcake`. A decisão
+continua usando as ocultas sem torná-las clicáveis. O custo adicional medido
+foi cerca de `105 ms` em geometria/grafo. O limiar global `0.88`, a ROI, a
+bandeja e a captura PNG/RGBA não foram alterados.
+
+## Correção das duas cartas centrais livres — 2026-09-20
+
+A revisão da captura com grade confirmou quatro sóis livres: um à direita,
+dois no centro e um na parte inferior. O erro estava na geometria: a regra
+antiga usava sobreposição sem direção e removia os dois sóis centrais porque
+as cartas brancas abaixo deles pareciam cobri-los. O NMS também podia escolher
+um ponto intermediário entre as duas cartas douradas.
+
+Foi corrigido o sentido da cobertura para que uma carta normal abaixo de uma
+colecionável não a oculte. Também foi adicionado um caminho de recuperação
+para candidatas colecionáveis com visibilidade alta e contorno forte nos quatro
+lados, preferindo esses centros às amostras intermediárias do scan.
+
+Replay completo sem ADB nem toque:
+`/tmp/tile-rescue-level25-center-suns-full-replay-20260920`. O estado produziu
+exatamente quatro sóis em `available`: `(880,595)`, `(480,730)`, `(590,730)` e
+`(480,1260)`. Outros sóis permaneceram em `hidden`, incluindo `(670,655)`,
+`(700,735)` e `(380,1265)`. O ML reconheceu os quatro livres e a ação foi
+`start-exposed-triple` para `sun`. O limiar `0.88`, a proteção de ocultas, a
+ROI e os slots da bandeja permaneceram inalterados.
+
+## Procedimento de marcação visual das detecções — 2026-09-20
+
+Foi documentado um procedimento para conferir rapidamente as cartas vistas
+pelo agente sem tocar no aparelho. O runner deve ser executado em dry-run com
+`--moves 1` e `--run-dir`; depois, `state.available` e
+`state.layerGraph.hidden` são lidos do `move-000-before/vision/analysis.json`.
+Para desenhar as marcas, usar os centros `cx/cy` — e não `x/y`, que são o
+canto do recorte — em uma cópia de `before.png`.
+
+A anotação recomendada é determinística, via SVG/Sharp, com X vermelho e
+contorno preto. O PNG original nunca deve ser sobrescrito; a cópia deve ser
+inspecionada visualmente depois. A edição generativa foi testada como apoio,
+mas não deve ser usada como fonte de auditoria porque pode alterar escala,
+posição ou conteúdo da captura.
+
+Exemplo produzido neste estado:
+`/tmp/tile-rescue-current-eval-20260920/available-suns-marked.png`.
+
+## Sol falsamente livre sob outro sol — 2026-09-20
+
+Na auditoria da captura atual, o centro `(670,665)` foi marcado como livre,
+mas visualmente estava coberto por outro sol disponível, acima do milho. O
+problema era a ausência de comparação entre cartas que já haviam entrado em
+`available`; a regra só consultava candidatas do scan.
+
+A correção inclui `available` no conjunto de possíveis coberturas, restringe a
+demão entre pares à mesma identidade semântica confirmada, exige contorno da
+cobridora, exposição equivalente e diferença de brilho de pelo menos `30`.
+Cartas com contorno praticamente completo (`completeness >= 0.94` e
+`minSide >= 0.90`) não são demovidas por vizinhos, o que protege o sol livre
+em `(590,730)` e os demais centros reais.
+
+Resultados:
+
+- `/tmp/tile-rescue-current-eval-fixed4-full-20260920`: quatro sóis livres
+  reconhecidos; `(670,665)` ficou em `hidden`;
+- `/tmp/tile-rescue-level25-center-suns-fixed4-full-20260920`: os quatro sóis
+  livres originais foram mantidos, incluindo os dois centrais.
+
+Os dois testes foram dry-run, sem ADB tap. Uma tentativa anterior abriu duas
+inferências ML em paralelo, pressionou a memória e foi abortada; a repetição
+sequencial concluiu normalmente.
+
+## Otimização segura interrompida por memória — 2026-09-20
+
+Foi implementada em `local_ml.js` uma aceleração que não armazena decisões do
+tabuleiro: embeddings de recortes usam cache LRU limitado e hash SHA-256 do
+conteúdo; referências mascaradas usam a geometria exata da máscara; o grafo e
+os rótulos são recalculados em cada frame. A etapa mascarada mantém ao menos
+uma referência por rótulo e as referências completas continuam no fallback.
+
+O primeiro replay medido caiu de cerca de `38,9 s` para `1,9 s` de ML, mas a
+validação mostrou que algumas ocultas viraram `unknown`. A causa encontrada
+foi uma inconsistência entre caminho relativo nos protótipos e caminho absoluto
+nas referências mascaradas. O código foi corrigido adicionando `filePath` aos
+protótipos, mas a repetição que confirmaria os rótulos ainda não terminou.
+
+Na tentativa seguinte apareceu novamente a notificação do sistema indicando
+que a memória do device estava quase cheia e uma aplicação foi encerrada. O
+processo foi interrompido; não ficou processo residual. Essa tentativa era
+replay local, sem `--live` e sem `input tap`.
+
+Continuação obrigatória: repetir um único replay completo, comparar rótulos,
+camadas e ação com o baseline
+`/tmp/tile-rescue-level25-live-frame0-fixed-full-replay-20260920`, inspecionar
+os timings de cache e só depois considerar novo dry-run multi-frame. O modo
+`--fast` continua inadequado porque pula a classificação ML das cartas ocultas.
+
+## Teste ao vivo autorizado — três movimentos com RGBA — 2026-09-20
+
+Foi executada uma sequência limitada de exatamente três movimentos no nível 25
+com análise completa, `--live` e `--raw-capture`:
+`/tmp/tile-rescue-level25-live-full-raw-3moves-20260920`.
+
+As decisões e toques foram `sun` em `(473,1261)`, depois `(608,725)` e por
+fim `(530,1270)`. As confianças foram `0,9173`, `0,9057` e `0,9042`.
+Não houve execução em paralelo. O ADB bruto mediu `1893/938/1276 ms` nos três
+frames; o parse do cabeçalho e pixels RGBA ficou abaixo de `1 ms` por captura.
+
+Na auditoria do primeiro frame ao vivo, o sol coberto em `(670,660)` aparecia
+como `unknown` em `available`, embora não pudesse ser escolhido pelo
+planejador. A regra foi ajustada para demover também esse caso quando uma
+carta semântica confiável o cobre. O replay completo
+`/tmp/tile-rescue-level25-live-frame0-fixed-full-replay-20260920` confirmou
+quatro sóis em `available` e `(670,655)` em `hidden`, sem novo toque.

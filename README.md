@@ -9,6 +9,8 @@ npm install
 npm test
 node play.js --dry-run        # captura e recomenda, não toca na tela
 node play.js --live --moves 1 # executa somente depois de revisar a recomendação
+node play.js --dry-run --fast # caminho rápido, sem auditoria visual completa
+node play.js --dry-run --fast --raw-capture # experimento: captura RGBA sem PNG
 node agent.js                 # entrada legada/diagnóstico
 VISION_PACKET_DIR=/tmp/tile-rescue-vision node agent.js --export-vision
 node local_ml.js /tmp/tile-rescue-vision
@@ -21,6 +23,19 @@ execução, reutiliza as referências nomeadas, espera a animação terminar ap�
 cada toque e nunca usa moedas, anúncios ou os botões de reforço. O padrão é
 dry-run e o limite padrão é um movimento; aumente `--moves` somente depois de
 revisar a recomendação.
+
+O modo completo classifica também hipóteses ocultas e grava todos os artefatos
+de auditoria. `--fast` classifica somente cartas disponíveis e da bandeja,
+mantém a proteção contra cartas ocultas e omite overlays/contact sheets. Use
+`--replay-dir /tmp/execucao-anterior` para reprocessar capturas existentes sem
+ADB. Os tempos detalhados de cada movimento ficam em `timing.json`.
+Em uma execução rápida com mais de um movimento, a checagem geométrica
+duplicada pós-toque é adiada para a análise seguinte da mesma captura; no
+último movimento permitido ela continua imediata para preservar a detecção de
+conclusão.
+`--raw-capture` é experimental e só altera a captura ADB; o padrão continua
+PNG para preservar o caminho já auditado. O modo bruto valida o cabeçalho e o
+payload RGBA antes de entregar a imagem à visão.
 
 ## Estratégia
 

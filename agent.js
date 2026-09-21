@@ -1,6 +1,7 @@
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 const sharp = require('sharp');
 const {
   applyVisionLabels,
@@ -40,6 +41,12 @@ function adb(args, options = {}) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function recordTiming(timing, key, startedAt) {
+  if (!timing) return;
+  const elapsed = performance.now() - startedAt;
+  timing[key] = Number(((timing[key] || 0) + elapsed).toFixed(3));
 }
 
 async function analyzeImage(image, clusters) {
@@ -368,6 +375,98 @@ function boardCardScore(image, cx, cy) {
   return light / samples;
 }
 
+function luminance(r, g, b) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// Layer order is visible at the card boundary, not in the icon palette. In
+// particular, collectible cards are deliberately yellow/gold, so a color
+// test would confuse a valid sun with a lower layer. Sample the face just
+// inside each expected edge and the pixels just outside it. A foreground
+// card has a continuous light/contrast transition on its own border; a card
+// covered by another face loses that transition where the cover crosses it.
+function cardEdgeProfile(image, cx, cy) {
+  const sides = { top: [], right: [], bottom: [], left: [] };
+  const samples = 19;
+  for (let i = 0; i < samples; i++) {
+    const t = -0.72 + (1.44 * i) / (samples - 1);
+    const dx = Math.round(t * 108);
+    const dy = Math.round(t * 126);
+    const points = {
+      top: { axis: 'y', center: cy - 74, tangent: [cx + dx, null] },
+      right: { axis: 'x', center: cx + 65, tangent: [null, cy + dy] },
+      bottom: { axis: 'y', center: cy + 74, tangent: [cx + dx, null] },
+      left: { axis: 'x', center: cx - 65, tangent: [null, cy + dy] },
+    };
+    for (const [side, point] of Object.entries(points)) {
+      let best = 0;
+      for (let offset = -12; offset <= 12; offset += 2) {
+        const before = point.axis === 'y'
+          ? [point.tangent[0], point.center + offset - 3]
+          : [point.center + offset - 3, point.tangent[1]];
+        const after = point.axis === 'y'
+          ? [point.tangent[0], point.center + offset + 3]
+          : [point.center + offset + 3, point.tangent[1]];
+        const [br, bg, bb] = pixel(image, before[0], before[1]);
+        const [ar, ag, ab] = pixel(image, after[0], after[1]);
+        const beforeLuma = luminance(br, bg, bb);
+        const afterLuma = luminance(ar, ag, ab);
+        const high = Math.max(beforeLuma, afterLuma);
+        const contrast = Math.abs(beforeLuma - afterLuma);
+        // Absolute RGB thresholds are intentionally avoided: gold faces and
+        // white faces have different colors, but both should contrast with
+        // the board outside their own border.
+        if (high >= 105 && contrast >= 18) best = Math.max(best, contrast);
+      }
+      sides[side].push(best);
+    }
+  }
+
+  const score = values => values.filter(value => value >= 18).length / values.length;
+  const sideScores = Object.fromEntries(Object.entries(sides).map(([side, values]) => [side, Number(score(values).toFixed(3))]));
+  const values = Object.values(sideScores);
+  return {
+    ...sideScores,
+    completeness: Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(3)),
+    minSide: Number(Math.min(...values).toFixed(3)),
+  };
+}
+
+function hasCompleteCardEdge(edge) {
+  return edge && edge.completeness >= 0.62 && edge.minSide >= 0.38;
+}
+
+function hasStrongExposedEdge(edge) {
+  return edge && edge.completeness >= 0.85 && edge.minSide >= 0.70;
+}
+
+function hasFullyExposedEdge(edge) {
+  return edge && edge.completeness >= 0.94 && edge.minSide >= 0.90;
+}
+
+function cardFaceBrightness(image, cx, cy) {
+  // Sample the face away from the icon and the border. This is deliberately
+  // a relative luminance measure: a gold collectible and a white normal card
+  // may have different absolute colors, but a foreground face is normally
+  // brighter than the dimmer face it covers.
+  const patches = [
+    [-48, -52], [48, -52],
+    [-48, 52], [48, 52],
+  ];
+  let total = 0;
+  let count = 0;
+  for (const [ox, oy] of patches) {
+    for (let y = cy + oy - 5; y <= cy + oy + 5; y += 5) {
+      for (let x = cx + ox - 5; x <= cx + ox + 5; x += 5) {
+        const [r, g, b] = pixel(image, x, y);
+        total += luminance(r, g, b);
+        count++;
+      }
+    }
+  }
+  return Number((total / count).toFixed(1));
+}
+
 function boardAreaTiles(image, components = []) {
   const out = [];
   const candidates = [];
@@ -378,11 +477,14 @@ function boardAreaTiles(image, components = []) {
   // out of the playable set.
   for (const component of components) {
     const visibility = boardCardScore(image, component.cx, component.cy);
+    const edge = cardEdgeProfile(image, component.cx, component.cy);
     if (visibility < 0.75) continue;
     candidates.push({
       cx: component.cx,
       cy: component.cy,
       visibility,
+      edge,
+      faceBrightness: cardFaceBrightness(image, component.cx, component.cy),
       source: 'component',
       area: component.area,
     });
@@ -393,7 +495,15 @@ function boardAreaTiles(image, components = []) {
   for (let cy = BOARD_ROI.y0 + 40; cy <= BOARD_ROI.y1 - 40; cy += 10) {
     for (let cx = BOARD_ROI.x0 + 70; cx <= BOARD_ROI.x1 - 70; cx += 10) {
       const visibility = boardCardScore(image, cx, cy);
-      if (visibility >= 0.82) candidates.push({ cx, cy, visibility, source: 'scan' });
+      if (visibility < 0.82) continue;
+      candidates.push({
+        cx,
+        cy,
+        visibility,
+        edge: cardEdgeProfile(image, cx, cy),
+        faceBrightness: cardFaceBrightness(image, cx, cy),
+        source: 'scan',
+      });
     }
   }
 
@@ -402,12 +512,14 @@ function boardAreaTiles(image, components = []) {
   // suppressed when its rectangle overlaps the stronger candidate.
   candidates.sort((a, b) => {
     const sourceOrder = Number(b.source === 'component') - Number(a.source === 'component');
-    return sourceOrder || b.visibility - a.visibility;
+    const edgeScore = candidate => candidate.edge
+      ? candidate.edge.completeness * 0.5 + candidate.edge.minSide * 0.5
+      : 0;
+    return sourceOrder || edgeScore(b) - edgeScore(a) || b.visibility - a.visibility;
   });
   for (const candidate of candidates) {
     const overlaps = out.some(prev =>
-      Math.abs(prev.cx - candidate.cx) < 120 &&
-      Math.abs(prev.cy - candidate.cy) < 135);
+      Math.hypot(prev.cx - candidate.cx, prev.cy - candidate.cy) < 75);
     if (overlaps) continue;
     const signature = descriptor(image, candidate.cx, candidate.cy);
     if (!signature) continue;
@@ -420,6 +532,8 @@ function boardAreaTiles(image, components = []) {
       visibility: Number(candidate.visibility.toFixed(3)),
       cx: candidate.cx,
       cy: candidate.cy,
+      edge: candidate.edge,
+      faceBrightness: candidate.faceBrightness,
       signature,
       variant: cardVariant(image, candidate.cx, candidate.cy),
     });
@@ -440,7 +554,13 @@ function boardAreaTiles(image, components = []) {
       const overlapHeight = Math.max(0, 190 - dy);
       return (overlapWidth * overlapHeight) / (190 * 190) >= 0.04;
     });
-    if (cover) {
+    // The board is layered diagonally: a normal card below a collectible can
+    // be visually adjacent without covering the collectible above it. The
+    // old directionless overlap rule discarded the two exposed center suns.
+    // Keep normal-card coverage evidence only when the normal face is above;
+    // collectible-over-collectible coverage is decided later using relative
+    // face brightness and a validated edge profile.
+    if (cover && (cover.variant !== 'normal' || cover.cy <= tile.cy)) {
       tile.playable = false;
       tile.occludedBy = { cx: cover.cx, cy: cover.cy };
     }
@@ -479,11 +599,45 @@ function boardLayerCandidates(image, threshold = 0.38) {
       cx: candidate.cx,
       cy: candidate.cy,
       visibility: Number(candidate.visibility.toFixed(3)),
+      edge: cardEdgeProfile(image, candidate.cx, candidate.cy),
+      faceBrightness: cardFaceBrightness(image, candidate.cx, candidate.cy),
       signature,
       variant: cardVariant(image, candidate.cx, candidate.cy),
     });
   }
   return out.sort((a, b) => a.cy - b.cy || a.cx - b.cx);
+}
+
+function recoverStrongCollectibles(image, available, candidates) {
+  const recovered = candidates
+    .filter(candidate => candidate.variant === 'collectible')
+    .filter(candidate => candidate.visibility >= 0.9)
+    // A scan point between two neighboring gold cards can have a high corner
+    // score, but it does not have the stable four-sided contour of a card.
+    // Requiring a strong profile recovers the two center suns without
+    // promoting the dense midpoint artifacts in the layer scan.
+    .filter(candidate => hasStrongExposedEdge(candidate.edge))
+    .filter(candidate => !available.some(tile =>
+      Math.hypot(tile.cx - candidate.cx, tile.cy - candidate.cy) < 55 &&
+      hasStrongExposedEdge(tile.edge)))
+    .map(candidate => ({
+      x: candidate.cx - 71,
+      y: candidate.cy - 80,
+      w: 142,
+      h: 160,
+      area: Math.round(candidate.visibility * 10000),
+      cx: candidate.cx,
+      cy: candidate.cy,
+      visibility: candidate.visibility,
+      edge: candidate.edge,
+      faceBrightness: candidate.faceBrightness,
+      signature: candidate.signature,
+      variant: candidate.variant,
+      source: 'layer-recovery',
+    }));
+  // Prefer the strong layer candidate over a nearby coarse scan point, then
+  // retain the existing detector's normal/collectible candidates.
+  return dedupeTiles(recovered.concat(available));
 }
 
 function layerOverlapRatio(a, b) {
@@ -492,10 +646,43 @@ function layerOverlapRatio(a, b) {
   return (overlapWidth * overlapHeight) / (190 * 190);
 }
 
-function buildLayerGraph(image, available) {
-  const candidates = boardLayerCandidates(image);
+function buildLayerGraph(image, available, candidates = boardLayerCandidates(image)) {
+  const availableWithBrightness = available.map(tile => ({
+    ...tile,
+    faceBrightness: tile.faceBrightness ?? cardFaceBrightness(image, tile.cx, tile.cy),
+  }));
+  const coverCandidates = candidates.concat(availableWithBrightness);
+  const occludedAvailable = new Set();
+  for (const tile of availableWithBrightness) {
+    // A nearly complete four-sided contour is stronger evidence of a free
+    // card than a brightness comparison against a neighboring scan candidate.
+    // This protects the exposed center sun whose face is adjacent to lower
+    // cards, while the weaker false-positive contour remains demotable.
+    if (hasFullyExposedEdge(tile.edge)) continue;
+    for (const cover of coverCandidates) {
+      if (cover === tile) continue;
+      if (Math.hypot(tile.cx - cover.cx, tile.cy - cover.cy) < 72) continue;
+      if (layerOverlapRatio(tile, cover) < 0.12) continue;
+      // A peer-card demotion must be semantic, not merely geometric: an
+      // untyped nearby candidate must not hide a reliably identified card.
+      if (cover.type && tile.type && tile.type !== 'unknown' && cover.type !== tile.type) continue;
+      const coverIsSemanticCollectible = cover.variant === 'collectible' || cover.type === 'sun';
+      if (cover.variant === 'normal' && !coverIsSemanticCollectible && cover.cy > tile.cy) continue;
+      // A card candidate is only allowed to demote another candidate when it
+      // is at least as exposed and materially brighter. This catches a dim
+      // lower face behind a foreground face while avoiding nearby scan points
+      // of the same card, which have nearly identical exposure.
+      if (cover.visibility + 0.02 < (tile.visibility || 0)) continue;
+      if (!hasCompleteCardEdge(cover.edge)) continue;
+      if (cover.faceBrightness - tile.faceBrightness < 30) continue;
+      occludedAvailable.add(`${tile.cx},${tile.cy}`);
+      break;
+    }
+  }
+  const playableAvailable = availableWithBrightness.filter(tile =>
+    !occludedAvailable.has(`${tile.cx},${tile.cy}`));
   const hidden = candidates.filter(candidate =>
-    !available.some(tile => Math.hypot(tile.cx - candidate.cx, tile.cy - candidate.cy) < 55));
+    !playableAvailable.some(tile => Math.hypot(tile.cx - candidate.cx, tile.cy - candidate.cy) < 55));
   const hiddenKeys = new Set(hidden.map(tile => `${tile.cx},${tile.cy}`));
   const edges = [];
   for (const a of candidates) {
@@ -555,6 +742,11 @@ function buildLayerGraph(image, available) {
       visibility: tile.visibility,
       variant: tile.variant,
     })),
+    available: playableAvailable,
+    occludedAvailable: [...occludedAvailable].map(key => {
+      const [cx, cy] = key.split(',').map(Number);
+      return { cx, cy };
+    }),
     hidden,
     edges: validatedEdges,
   };
@@ -673,26 +865,36 @@ function dedupeTiles(tiles) {
   return out;
 }
 
-function summarize(image, components, clusters) {
+function summarize(image, components, clusters, timing = null) {
   // White card faces can be merged with yellow components. Add a second seed
   // pass so a foreground chick/cupcake remains detectable when it overlaps a
   // collectible gold card.
+  const geometryStartedAt = performance.now();
   const neutralComponents = connectedComponents(image, BOARD_ROI, isNeutralCardPixel);
   const allComponents = components.concat(neutralComponents);
   const componentTiles = components
     .map(c => ({ ...c, signature: descriptor(image, c.cx, c.cy) }));
-  const exposed = boardAreaTiles(image, allComponents);
+  const coarseExposed = boardAreaTiles(image, allComponents);
+  const layerCandidates = boardLayerCandidates(image);
+  const exposed = recoverStrongCollectibles(image, coarseExposed, layerCandidates);
   const boardTiles = dedupeTiles(exposed.concat(componentTiles));
   const tiles = boardTiles.concat(trayTiles(image));
   assignTypes(tiles, clusters);
-  const available = exposed;
-  const layerGraph = buildLayerGraph(image, available);
+  recordTiming(timing, 'geometryMs', geometryStartedAt);
+
+  const layerGraphStartedAt = performance.now();
+  const layerGraph = buildLayerGraph(image, exposed, layerCandidates);
+  const available = layerGraph.available || exposed;
+  recordTiming(timing, 'layerGraphMs', layerGraphStartedAt);
+
   // Exposed slots were included in `tiles`, so their assigned type is now
   // available; using these references avoids accidentally treating a hidden
   // component as playable.
   const tray = tiles.filter(t => t.cy >= 1600 && t.cy <= 1900);
   const visible = tiles.filter(t => t.cy < BOARD_ROI.y1);
+  const occlusionGraphStartedAt = performance.now();
   const occlusionGraph = buildOcclusionGraph(image, available, tray);
+  recordTiming(timing, 'occlusionGraphMs', occlusionGraphStartedAt);
   const trayCounts = {};
   for (const t of tray) {
     const key = planningKeyForTile(t);

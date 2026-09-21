@@ -145,6 +145,42 @@
         "variant": "level24-board",
         "addedAt": "2026-09-20T20:58:31.157Z"
       }
+    ],
+    "carrot": [
+      {
+        "file": "carrot/board-0-209-584.png",
+        "sourceImage": "/tmp/tile-rescue-level25-live-profile-20260920/move-000-before/vision/crops/board-0-209-584.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T22:20:40.532Z"
+      },
+      {
+        "file": "carrot/board-2-600-720.png",
+        "sourceImage": "/tmp/tile-rescue-level25-live-profile-20260920/move-000-before/vision/crops/board-2-600-720.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T22:20:40.689Z"
+      },
+      {
+        "file": "carrot/board-6-472-1261.png",
+        "sourceImage": "/tmp/tile-rescue-level25-live-profile-20260920/move-000-before/vision/crops/board-6-472-1261.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T22:20:45.827Z"
+      }
+    ],
+    "corn": [
+      {
+        "file": "corn/board-3-472-859.png",
+        "sourceImage": "/tmp/tile-rescue-device-readiness-20260920/move-000-before/vision/crops/board-3-472-859.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T23:07:06.817Z"
+      }
+    ],
+    "fox": [
+      {
+        "file": "fox/board-4-608-859.png",
+        "sourceImage": "/tmp/tile-rescue-device-readiness-20260920/move-000-before/vision/crops/board-4-608-859.png",
+        "variant": "normal",
+        "addedAt": "2026-09-20T23:07:06.923Z"
+      }
     ]
   }
 }

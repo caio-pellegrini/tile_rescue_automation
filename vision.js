@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 const sharp = require('sharp');
 
 const CARD_WIDTH = 142;
@@ -10,6 +11,12 @@ const CONTACT_CELL_HEIGHT = 190;
 const MASK_BACKGROUND = '#149b7d';
 const UNKNOWN_GROUP_MIN_CONFIDENCE = 0.80;
 const MIN_MASK_COVER_CONFIDENCE = 0.80;
+
+function recordTiming(timing, key, startedAt) {
+  if (!timing) return;
+  const elapsed = performance.now() - startedAt;
+  timing[key] = Number(((timing[key] || 0) + elapsed).toFixed(3));
+}
 
 function planningKeyForTile(tile) {
   if (!tile) return null;
@@ -465,7 +472,10 @@ function graphOverlaySvg(imageInfo, state) {
   return Buffer.from(`<svg width="${imageInfo.width}" height="${imageInfo.height}">${edgeSvg}${nodeSvg}${legend}</svg>`);
 }
 
-async function writeVisionPacket(image, state, outputDir) {
+async function writeVisionPacket(image, state, outputDir, timing = null, options = {}) {
+  const audit = options.audit !== false;
+  const includeVisibleCrops = options.includeVisibleCrops !== false;
+  const packetStartedAt = performance.now();
   const manifest = buildVisionManifest(state, image.info);
   const cropsDir = path.join(outputDir, 'crops');
   const visibleDir = path.join(outputDir, 'visible');
@@ -473,13 +483,19 @@ async function writeVisionPacket(image, state, outputDir) {
   await fs.mkdir(visibleDir, { recursive: true });
 
   const screenPath = path.join(outputDir, 'screen.png');
-  await sharp(image.data, { raw: image.info }).png().toFile(screenPath);
+  if (audit) {
+    const screenStartedAt = performance.now();
+    await sharp(image.data, { raw: image.info }).png().toFile(screenPath);
+    recordTiming(timing, 'screenWriteMs', screenStartedAt);
+  }
 
-  if (manifest.layerGraph.nodes?.length) {
+  if (audit && manifest.layerGraph.nodes?.length) {
+    const overlayStartedAt = performance.now();
     await sharp(image.data, { raw: image.info })
       .composite([{ input: graphOverlaySvg(image.info, state), left: 0, top: 0 }])
       .png()
       .toFile(path.join(outputDir, 'layer-graph-overlay.png'));
+    recordTiming(timing, 'overlayWriteMs', overlayStartedAt);
     manifest.debugArtifacts = {
       layerGraphOverlay: 'layer-graph-overlay.png',
       rawCrops: 'crops/',
@@ -491,13 +507,16 @@ async function writeVisionPacket(image, state, outputDir) {
   const visibleComposites = [];
   const visibleTiles = manifest.tiles.filter(tile => tile.visibleCrop && tile.visibleVariants?.length);
   for (const tile of manifest.tiles) {
+    const cropStartedAt = performance.now();
     const crop = await sharp(image.data, { raw: image.info })
       .extract(tile.box)
       .png()
       .toBuffer();
     await fs.writeFile(path.join(outputDir, tile.crop), crop);
+    recordTiming(timing, 'cropGenerationMs', cropStartedAt);
 
-    if (tile.visibleCrop && tile.visibleVariants?.length) {
+    if (includeVisibleCrops && tile.visibleCrop && tile.visibleVariants?.length) {
+      const visibleCropStartedAt = performance.now();
       const visibleCrop = await sharp(crop)
         .composite([{ input: visibleCropSvg(tile.box, [
           tile.visibleVariants[0].cover,
@@ -513,6 +532,7 @@ async function writeVisionPacket(image, state, outputDir) {
           .toBuffer();
         await fs.writeFile(path.join(outputDir, variant.crop), variantCrop);
       }
+      recordTiming(timing, 'visibleCropGenerationMs', visibleCropStartedAt);
       const visibleIndex = visibleComposites.length / 2;
       const visibleX = (visibleIndex % CONTACT_COLUMNS) * CONTACT_CELL_WIDTH;
       const visibleY = Math.floor(visibleIndex / CONTACT_COLUMNS) * CONTACT_CELL_HEIGHT;
@@ -543,20 +563,25 @@ async function writeVisionPacket(image, state, outputDir) {
     });
   }
 
-  const rows = Math.max(1, Math.ceil(manifest.tiles.length / CONTACT_COLUMNS));
-  await sharp({
-    create: {
-      width: CONTACT_COLUMNS * CONTACT_CELL_WIDTH,
-      height: rows * CONTACT_CELL_HEIGHT,
-      channels: 3,
-      background: '#0c1118',
-    },
-  })
-    .composite(composites)
-    .png()
-    .toFile(path.join(outputDir, 'contact-sheet.png'));
+  if (audit) {
+    const rows = Math.max(1, Math.ceil(manifest.tiles.length / CONTACT_COLUMNS));
+    const contactSheetStartedAt = performance.now();
+    await sharp({
+      create: {
+        width: CONTACT_COLUMNS * CONTACT_CELL_WIDTH,
+        height: rows * CONTACT_CELL_HEIGHT,
+        channels: 3,
+        background: '#0c1118',
+      },
+    })
+      .composite(composites)
+      .png()
+      .toFile(path.join(outputDir, 'contact-sheet.png'));
+    recordTiming(timing, 'contactSheetWriteMs', contactSheetStartedAt);
+  }
 
-  if (visibleTiles.length) {
+  if (audit && visibleTiles.length) {
+    const visibleContactSheetStartedAt = performance.now();
     const visibleRows = Math.max(1, Math.ceil(visibleTiles.length / CONTACT_COLUMNS));
     await sharp({
       create: {
@@ -569,8 +594,10 @@ async function writeVisionPacket(image, state, outputDir) {
       .composite(visibleComposites)
       .png()
       .toFile(path.join(outputDir, 'visible-contact-sheet.png'));
+    recordTiming(timing, 'visibleContactSheetWriteMs', visibleContactSheetStartedAt);
   }
 
+  const metadataStartedAt = performance.now();
   await fs.writeFile(
     path.join(outputDir, 'manifest.json'),
     `${JSON.stringify(manifest, null, 2)}\n`,
@@ -579,6 +606,8 @@ async function writeVisionPacket(image, state, outputDir) {
     path.join(outputDir, 'layer-graph-validation.json'),
     `${JSON.stringify(manifest.layerGraphValidation, null, 2)}\n`,
   );
+  recordTiming(timing, 'manifestWriteMs', metadataStartedAt);
+  recordTiming(timing, 'totalMs', packetStartedAt);
   return { outputDir, manifest, screenPath };
 }
 

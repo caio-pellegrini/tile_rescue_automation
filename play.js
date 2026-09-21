@@ -1,6 +1,7 @@
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 const sharp = require('sharp');
 
 const {
@@ -18,6 +19,7 @@ const DEFAULT_DEVICE = process.env.DEVICE || 'RQCY903RJQN';
 const DEFAULT_LEVEL = process.env.LEVEL || '23';
 const DEFAULT_SETTLE_MS = Number(process.env.SETTLE_MS || 1200);
 const DEFAULT_MAX_MOVES = Number(process.env.MAX_MOVES || 1);
+const RAW_RGBA_8888_PIXEL_FORMAT = 1;
 
 function usage() {
   console.log(`Tile Rescue runner
@@ -25,7 +27,8 @@ function usage() {
 Uso:
   node play.js [--dry-run] [--live] [--moves N]
               [--device SERIAL] [--level N] [--run-dir PATH]
-              [--settle-ms N] [--no-ml]
+              [--settle-ms N] [--no-ml] [--fast] [--live-fast]
+              [--replay-dir PATH] [--raw-capture]
 
 O padrão é dry-run: captura, classifica e recomenda sem tocar no celular.
 `);
@@ -39,6 +42,9 @@ function parseArgs(argv) {
     level: DEFAULT_LEVEL,
     settleMs: DEFAULT_SETTLE_MS,
     runDir: null,
+    replayDir: null,
+    fast: false,
+    rawCapture: false,
     useMl: true,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -51,6 +57,13 @@ function parseArgs(argv) {
       options.live = false;
     } else if (arg === '--no-ml') {
       options.useMl = false;
+    } else if (arg === '--fast') {
+      options.fast = true;
+    } else if (arg === '--live-fast') {
+      options.live = true;
+      options.fast = true;
+    } else if (arg === '--raw-capture') {
+      options.rawCapture = true;
     } else if (arg === '--moves') {
       options.maxMoves = Number(argv[++i]);
     } else if (arg === '--device') {
@@ -59,6 +72,8 @@ function parseArgs(argv) {
       options.level = argv[++i];
     } else if (arg === '--run-dir') {
       options.runDir = argv[++i];
+    } else if (arg === '--replay-dir') {
+      options.replayDir = argv[++i];
     } else if (arg === '--settle-ms') {
       options.settleMs = Number(argv[++i]);
     } else {
@@ -71,7 +86,16 @@ function parseArgs(argv) {
   if (!Number.isFinite(options.settleMs) || options.settleMs < 0) {
     throw new Error('--settle-ms precisa ser um número não negativo');
   }
+  if (options.live && options.replayDir) {
+    throw new Error('--replay-dir só pode ser usado em dry-run');
+  }
   return options;
+}
+
+function recordTiming(timing, key, startedAt) {
+  if (!timing) return;
+  const elapsed = performance.now() - startedAt;
+  timing[key] = Number(((timing[key] || 0) + elapsed).toFixed(3));
 }
 
 function adb(device, args) {
@@ -85,9 +109,83 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function capture(device) {
-  const png = adb(device, ['exec-out', 'screencap', '-p']);
-  return sharp(png).raw().toBuffer({ resolveWithObject: true });
+function parseRawScreencap(raw) {
+  if (!Buffer.isBuffer(raw) || raw.length < 16) {
+    throw new Error(`screencap bruto inválido: cabeçalho ausente (${raw?.length || 0} bytes)`);
+  }
+  const width = raw.readUInt32LE(0);
+  const height = raw.readUInt32LE(4);
+  const pixelFormat = raw.readUInt32LE(8);
+  const dataSpace = raw.readUInt32LE(12);
+  if (pixelFormat !== RAW_RGBA_8888_PIXEL_FORMAT) {
+    throw new Error(
+      `screencap bruto não suportado: pixel format ${pixelFormat}; `
+      + `esperado RGBA_8888 (${RAW_RGBA_8888_PIXEL_FORMAT})`,
+    );
+  }
+  const payloadBytes = width * height * 4;
+  if (!width || !height || !Number.isSafeInteger(payloadBytes) || raw.length !== 16 + payloadBytes) {
+    throw new Error(
+      `screencap bruto não suportado: ${width}x${height}, ${raw.length} bytes; `
+      + `esperado ${16 + payloadBytes}`,
+    );
+  }
+  return {
+    data: raw.subarray(16),
+    info: { width, height, channels: 4 },
+    header: { pixelFormat, dataSpace },
+  };
+}
+
+async function capture(device, timing = null, rawCapture = false) {
+  const startedAt = performance.now();
+  const adbStartedAt = performance.now();
+  const bytes = adb(device, rawCapture
+    ? ['exec-out', 'screencap']
+    : ['exec-out', 'screencap', '-p']);
+  recordTiming(timing, 'adbMs', adbStartedAt);
+  const decodeStartedAt = performance.now();
+  let image;
+  if (rawCapture) {
+    image = parseRawScreencap(bytes);
+    if (timing) {
+      timing.format = 'raw-rgba';
+      timing.rawHeader = image.header;
+    }
+    recordTiming(timing, 'rawParseMs', decodeStartedAt);
+  } else {
+    image = await sharp(bytes).raw().toBuffer({ resolveWithObject: true });
+    if (timing) timing.format = 'png';
+    recordTiming(timing, 'decodeMs', decodeStartedAt);
+  }
+  recordTiming(timing, 'totalMs', startedAt);
+  return image;
+}
+
+async function loadReplayImage(filePath, timing = null) {
+  const startedAt = performance.now();
+  const png = await fs.readFile(filePath);
+  recordTiming(timing, 'fileReadMs', startedAt);
+  const decodeStartedAt = performance.now();
+  const image = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+  recordTiming(timing, 'decodeMs', decodeStartedAt);
+  recordTiming(timing, 'totalMs', startedAt);
+  return image;
+}
+
+async function replayFramePaths(replayDir, maxMoves) {
+  const paths = [];
+  for (let move = 0; move < maxMoves; move++) {
+    const filePath = path.join(replayDir, `move-${String(move).padStart(3, '0')}-before`, 'before.png');
+    try {
+      await fs.access(filePath);
+    } catch {
+      break;
+    }
+    paths.push(filePath);
+  }
+  if (!paths.length) throw new Error(`nenhuma captura before encontrada em ${replayDir}`);
+  return paths;
 }
 
 function timestamp() {
@@ -206,23 +304,45 @@ function stateForLog(state) {
   };
 }
 
-async function analyze(image, options, clusters, classifier, packetDir) {
+async function analyze(image, options, clusters, classifier, packetDir, timing = {}) {
+  timing.startedAt = new Date().toISOString();
+  const analysisStartedAt = performance.now();
+  timing.stages ||= {};
+  timing.artifacts ||= {};
+  timing.ml ||= {};
+  const geometryStartedAt = performance.now();
   const components = require('./agent').connectedComponents(image);
-  const state = summarize(image, components, clusters);
+  recordTiming(timing.stages, 'connectedComponentsMs', geometryStartedAt);
+  const state = summarize(image, components, clusters, timing.stages);
 
   // First write the packet so the local model can consume its crops. It is
   // rewritten after labels are applied, leaving the audit manifest readable.
-  await writeVisionPacket(image, state, packetDir);
+  const packetOptions = options.fast
+    ? { audit: false, includeVisibleCrops: false }
+    : { audit: true, includeVisibleCrops: true };
+  await writeVisionPacket(image, state, packetDir, timing.artifacts, packetOptions);
   let ml = null;
   if (classifier) {
-    ml = await classifier.classifyPacket(packetDir);
+    ml = await classifier.classifyPacket(packetDir, timing.ml, {
+      classifyHidden: !options.fast,
+    });
+    timing.ml = ml.timing || timing.ml;
+    const predictionWriteStartedAt = performance.now();
     await writeJson(path.join(packetDir, 'local-predictions.json'), ml);
+    recordTiming(timing.artifacts, 'jsonWriteMs', predictionWriteStartedAt);
+    const applyLabelsStartedAt = performance.now();
     applyVisionLabels(state, ml.predictions, 0.75);
-    await writeVisionPacket(image, state, packetDir);
+    recordTiming(timing.stages, 'applyLabelsMs', applyLabelsStartedAt);
+    await writeVisionPacket(image, state, packetDir, timing.artifacts, packetOptions);
   }
 
+  const chooseActionStartedAt = performance.now();
   const action = chooseAction(state);
+  recordTiming(timing.stages, 'chooseActionMs', chooseActionStartedAt);
+  const phaseMapStartedAt = performance.now();
   await writeJson(path.join(packetDir, 'phase-map.json'), buildPhaseMap(state));
+  recordTiming(timing.artifacts, 'jsonWriteMs', phaseMapStartedAt);
+  const analysisStartedAtForWrite = performance.now();
   const analysis = {
     capturedAt: new Date().toISOString(),
     screenReady: screenLooksLikeTileRescue(image),
@@ -235,13 +355,18 @@ async function analyze(image, options, clusters, classifier, packetDir) {
       referenceCount: ml.referenceCount,
       tileCount: ml.tileCount,
       inferenceMs: ml.inferenceMs,
+      timing: ml.timing || null,
     } : null,
+    timing,
   };
   await writeJson(path.join(packetDir, 'analysis.json'), analysis);
+  recordTiming(timing.artifacts, 'jsonWriteMs', analysisStartedAtForWrite);
+  recordTiming(timing.stages, 'analysisMs', analysisStartedAt);
   return analysis;
 }
 
-async function savePhase(image, analysis, phaseDir, phase, options) {
+async function savePhase(image, analysis, phaseDir, phase, options, timing = null) {
+  const startedAt = performance.now();
   await fs.mkdir(phaseDir, { recursive: true });
   await sharp(image.data, { raw: image.info }).png().toFile(path.join(phaseDir, `${phase}.png`));
   await writeJson(path.join(phaseDir, `${phase}.json`), {
@@ -253,7 +378,9 @@ async function savePhase(image, analysis, phaseDir, phase, options) {
     action: analysis.action,
     screenReady: analysis.screenReady,
     stateSummary: analysis.stateSummary,
+    timing: analysis.timing || timing,
   });
+  recordTiming(timing?.artifacts, 'phaseWriteMs', startedAt);
 }
 
 function consoleSummary(move, options, analysis) {
@@ -326,9 +453,12 @@ async function main() {
     device: options.device,
     level: options.level,
     live: options.live,
+    fast: options.fast,
+    rawCapture: options.rawCapture,
     maxMoves: options.maxMoves,
     settleMs: options.settleMs,
     mlEnabled: options.useMl,
+    replayDir: options.replayDir,
     runDir,
     executedMoves: 0,
     completed: false,
@@ -340,7 +470,9 @@ async function main() {
   // The expensive local model is loaded once here and reused for every
   // observation in the run. This is the main performance benefit over the
   // old one-off command sequence.
+  const modelLoadStartedAt = performance.now();
   const classifier = options.useMl ? await createClassifier({}) : null;
+  run.modelLoadMs = Number((performance.now() - modelLoadStartedAt).toFixed(3));
   if (classifier) {
     run.ml = {
       model: classifier.model,
@@ -351,31 +483,97 @@ async function main() {
   }
   await writeJson(path.join(runDir, 'run.json'), run);
 
+  const replayPaths = options.replayDir
+    ? await replayFramePaths(path.resolve(options.replayDir), options.maxMoves)
+    : null;
   const clusters = [];
-  let image = await capture(options.device);
+  let firstCaptureTiming = {};
+  let previousAfterDir = null;
+  let image = replayPaths
+    ? await loadReplayImage(replayPaths[0], firstCaptureTiming)
+    : await capture(options.device, firstCaptureTiming, options.rawCapture);
   for (let move = 0; move < options.maxMoves; move++) {
+    const moveStartedAt = performance.now();
+    const timing = {
+      schemaVersion: 1,
+      move,
+      capture: firstCaptureTiming,
+      stages: {},
+      ml: {},
+      artifacts: {},
+      io: {},
+    };
     const phaseDir = path.join(runDir, `move-${String(move).padStart(3, '0')}-before`);
     const packetDir = path.join(phaseDir, 'vision');
-    const analysis = await analyze(image, options, clusters, classifier, packetDir);
-    await savePhase(image, analysis, phaseDir, 'before', options);
+    const analysis = await analyze(image, options, clusters, classifier, packetDir, timing);
+    await savePhase(image, analysis, phaseDir, 'before', options, timing);
     console.log(JSON.stringify(consoleSummary(move, options, analysis)));
 
     const terminal = detectTerminalStatus(analysis);
     if (terminal.completed) {
       run.completed = true;
       run.completionReason = terminal.completionReason;
+      if (previousAfterDir) {
+        const previousAfterPath = path.join(previousAfterDir, 'after.json');
+        try {
+          const previousAfter = JSON.parse(await fs.readFile(previousAfterPath, 'utf8'));
+          await writeJson(previousAfterPath, {
+            ...previousAfter,
+            completed: true,
+            completionReason: terminal.completionReason,
+            completionDetectedOn: 'next-analysis',
+          });
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+      timing.finishedAt = new Date().toISOString();
+      timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+      await writeJson(path.join(phaseDir, 'timing.json'), timing);
       break;
     }
     if (terminal.stopReason) {
       run.stopReason = terminal.stopReason;
+      timing.finishedAt = new Date().toISOString();
+      timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+      await writeJson(path.join(phaseDir, 'timing.json'), timing);
       break;
     }
-    if (!options.live) break;
+    if (!options.live && !replayPaths) {
+      timing.finishedAt = new Date().toISOString();
+      timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+      await writeJson(path.join(phaseDir, 'timing.json'), timing);
+      break;
+    }
     if (!analysis.action?.tile) {
       run.stopReason = 'no-action';
+      timing.finishedAt = new Date().toISOString();
+      timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+      await writeJson(path.join(phaseDir, 'timing.json'), timing);
       break;
     }
 
+    if (replayPaths) {
+      const nextPath = replayPaths[move + 1];
+      if (!nextPath) {
+        timing.finishedAt = new Date().toISOString();
+        timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+        await writeJson(path.join(phaseDir, 'timing.json'), timing);
+        break;
+      }
+      const nextCaptureTiming = {};
+      const replayStartedAt = performance.now();
+      image = await loadReplayImage(nextPath, nextCaptureTiming);
+      recordTiming(timing.io, 'nextReplayLoadMs', replayStartedAt);
+      timing.captureAfter = nextCaptureTiming;
+      timing.finishedAt = new Date().toISOString();
+      timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+      await writeJson(path.join(phaseDir, 'timing.json'), timing);
+      firstCaptureTiming = nextCaptureTiming;
+      continue;
+    }
+
+    const tapStartedAt = performance.now();
     adb(options.device, [
       'shell',
       'input',
@@ -383,11 +581,18 @@ async function main() {
       String(Math.round(analysis.action.tile.cx)),
       String(Math.round(analysis.action.tile.cy)),
     ]);
+    recordTiming(timing.io, 'tapAdbMs', tapStartedAt);
     run.executedMoves++;
+    const settleStartedAt = performance.now();
     await sleep(options.settleMs);
+    recordTiming(timing.io, 'settleWaitMs', settleStartedAt);
 
-    image = await capture(options.device);
+    const afterCaptureTiming = {};
+    image = await capture(options.device, afterCaptureTiming, options.rawCapture);
+    timing.captureAfter = afterCaptureTiming;
     const afterDir = path.join(runDir, `move-${String(move).padStart(3, '0')}-after`);
+    previousAfterDir = afterDir;
+    const afterWriteStartedAt = performance.now();
     await fs.mkdir(afterDir, { recursive: true });
     await sharp(image.data, { raw: image.info }).png().toFile(path.join(afterDir, 'after.png'));
     await writeJson(path.join(afterDir, 'after.json'), {
@@ -396,34 +601,57 @@ async function main() {
       device: options.device,
       level: options.level,
       source: 'post-tap observation; analyzed as the next before frame',
+      timing: afterCaptureTiming,
     });
+    recordTiming(timing.artifacts, 'afterWriteMs', afterWriteStartedAt);
 
-    // Detect an empty board immediately after the tap, before loading the
-    // classifier for another full analysis. This is the authoritative
-    // completion signal for a cleared level.
-    const postTapState = summarize(
-      image,
-      require('./agent').connectedComponents(image),
-      clusters,
-    );
-    const postTapTerminal = detectTerminalStatus({
-      state: postTapState,
-      screenReady: screenLooksLikeTileRescue(image),
-    });
-    if (postTapTerminal.completed) {
-      run.completed = true;
-      run.completionReason = postTapTerminal.completionReason;
-      await writeJson(path.join(afterDir, 'after.json'), {
-        phase: 'after',
-        capturedAt: new Date().toISOString(),
-        device: options.device,
-        level: options.level,
-        source: 'post-tap observation; analyzed as the next before frame',
-        completed: true,
-        completionReason: postTapTerminal.completionReason,
+    // The next fast analysis consumes this same `after` image, so repeating
+    // the full geometry/occlusion summary here only adds latency between
+    // taps. Keep the immediate completion check for the final allowed move;
+    // otherwise defer it to the next analysis, before another tap can occur.
+    const checkPostTapNow = !options.fast || move + 1 >= options.maxMoves;
+    if (checkPostTapNow) {
+      const postTapStartedAt = performance.now();
+      const postTapComponentsStartedAt = performance.now();
+      const postTapComponents = require('./agent').connectedComponents(image);
+      recordTiming(timing.io, 'postTapConnectedComponentsMs', postTapComponentsStartedAt);
+      const postTapState = summarize(
+        image,
+        postTapComponents,
+        clusters,
+        timing.io,
+      );
+      recordTiming(timing.io, 'postTapSummaryMs', postTapStartedAt);
+      const postTapTerminal = detectTerminalStatus({
+        state: postTapState,
+        screenReady: screenLooksLikeTileRescue(image),
       });
-      break;
+      if (postTapTerminal.completed) {
+        run.completed = true;
+        run.completionReason = postTapTerminal.completionReason;
+        await writeJson(path.join(afterDir, 'after.json'), {
+          phase: 'after',
+          capturedAt: new Date().toISOString(),
+          device: options.device,
+          level: options.level,
+          source: 'post-tap observation; analyzed as the next before frame',
+          completed: true,
+          completionReason: postTapTerminal.completionReason,
+          timing,
+        });
+        timing.finishedAt = new Date().toISOString();
+        timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+        await writeJson(path.join(phaseDir, 'timing.json'), timing);
+        break;
+      }
+    } else {
+      timing.io.postTapCheck = 'deferred-to-next-analysis';
     }
+
+    timing.finishedAt = new Date().toISOString();
+    timing.totalMoveMs = Number((performance.now() - moveStartedAt).toFixed(3));
+    await writeJson(path.join(phaseDir, 'timing.json'), timing);
+    firstCaptureTiming = afterCaptureTiming;
   }
 
   run.finishedAt = new Date().toISOString();
@@ -441,6 +669,7 @@ if (require.main === module) {
 module.exports = {
   buildPhaseMap,
   detectTerminalStatus,
+  parseRawScreencap,
   parseArgs,
   stateForLog,
   tileForLog,

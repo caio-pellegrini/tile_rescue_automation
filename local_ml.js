@@ -1,5 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const sharp = require('sharp');
 
 const DEFAULT_MODEL = process.env.LOCAL_VISION_MODEL || 'Xenova/clip-vit-base-patch32';
@@ -9,9 +11,43 @@ const PARTIAL_MIN_VISIBLE_FRACTION = 0.45;
 const PARTIAL_MIN_MARGIN = 0.01;
 const PARTIAL_STRONG_COVER_MARGIN = 0.005;
 const PARTIAL_CONFIRMED_PEERS = 2;
+const PARTIAL_REFERENCE_CANDIDATE_LIMIT = Number(process.env.LOCAL_VISION_PARTIAL_CANDIDATES || 8);
 const DEFAULT_LIBRARY_DIR = process.env.LOCAL_VISION_LIBRARY || path.resolve('icon-library');
 const CATALOG_FILE = 'catalog.json';
 const MASK_BACKGROUND = '#149b7d';
+const TILE_EMBEDDING_CACHE_LIMIT = 256;
+const PARTIAL_EMBEDDING_CACHE_LIMIT = 512;
+
+function cacheGet(cache, key) {
+  if (!cache || !cache.has(key)) return null;
+  const value = cache.get(key);
+  // Refresh insertion order so the bounded map behaves as an LRU cache.
+  cache.delete(key);
+  cache.set(key, value);
+  return value;
+}
+
+function cacheSet(cache, key, value, limit) {
+  if (!cache) return;
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > limit) cache.delete(cache.keys().next().value);
+}
+
+function referenceKey(reference) {
+  return `${reference.filePath}|${reference.variant || ''}`;
+}
+
+async function fileFingerprint(filePath) {
+  const data = await fs.readFile(filePath);
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function recordTiming(timing, key, startedAt) {
+  if (!timing) return;
+  const elapsed = performance.now() - startedAt;
+  timing[key] = Number(((timing[key] || 0) + elapsed).toFixed(3));
+}
 
 function cosine(a, b) {
   let dot = 0;
@@ -75,7 +111,14 @@ function visibleMaskSvg(box, covers, outputWidth = box.width, outputHeight = box
   return Buffer.from(`<svg width="${outputWidth}" height="${outputHeight}"><g>${rects}</g></svg>`);
 }
 
-async function buildPartialReferencePaths(packetDir, hiddenTiles, references) {
+async function buildPartialReferencePaths(
+  packetDir,
+  hiddenTiles,
+  references,
+  timing = null,
+  fileCache = null,
+  allowedReferenceKeys = null,
+) {
   const variantDir = path.join(packetDir, 'reference-variants');
   const entries = [];
   let created = 0;
@@ -93,28 +136,56 @@ async function buildPartialReferencePaths(packetDir, hiddenTiles, references) {
     await fs.mkdir(variantDir, { recursive: true });
     for (const visibleVariant of variants) {
       if (!visibleVariant.cover) continue;
+      const variantKey = `${tile.id}::${visibleVariant.key}`;
+      const allowed = allowedReferenceKeys?.get(variantKey) || null;
       for (const reference of references) {
+        if (allowed && !allowed.has(referenceKey(reference))) continue;
+        const maskKey = [
+          reference.filePath,
+          reference.variant || '',
+          visibleVariant.cover.cx - tile.box.left,
+          visibleVariant.cover.cy - tile.box.top,
+          tile.box.width,
+          tile.box.height,
+        ].join('|');
         const safeId = `${tile.id}--${visibleVariant.key}--${reference.label}--${reference.variant || 'default'}`
           .replace(/[^a-z0-9_.-]+/gi, '_');
-        const outputPath = path.join(variantDir, `${safeId}.png`);
-        const referenceBuffer = await fs.readFile(reference.filePath);
-        const referenceMetadata = await sharp(referenceBuffer).metadata();
-        await sharp(referenceBuffer)
-          .composite([{
-            input: visibleMaskSvg(
-              tile.box,
-              [visibleVariant.cover],
-              referenceMetadata.width || tile.box.width,
-              referenceMetadata.height || tile.box.height,
-            ),
-            left: 0,
-            top: 0,
-          }])
-          .png()
-          .toFile(outputPath);
+        let outputPath = cacheGet(fileCache, maskKey);
+        if (outputPath) {
+          try {
+            await fs.access(outputPath);
+            if (timing) timing.partialReferenceCacheHits = (timing.partialReferenceCacheHits || 0) + 1;
+          } catch {
+            outputPath = null;
+          }
+        }
+        if (!outputPath) {
+          outputPath = path.join(variantDir, `${safeId}.png`);
+          const readStartedAt = performance.now();
+          const referenceBuffer = await fs.readFile(reference.filePath);
+          recordTiming(timing, 'fileReadMs', readStartedAt);
+          const referenceMetadata = await sharp(referenceBuffer).metadata();
+          const transformStartedAt = performance.now();
+          await sharp(referenceBuffer)
+            .composite([{
+              input: visibleMaskSvg(
+                tile.box,
+                [visibleVariant.cover],
+                referenceMetadata.width || tile.box.width,
+                referenceMetadata.height || tile.box.height,
+              ),
+              left: 0,
+              top: 0,
+            }])
+            .png()
+            .toFile(outputPath);
+          recordTiming(timing, 'partialReferenceGenerationMs', transformStartedAt);
+          cacheSet(fileCache, maskKey, outputPath, PARTIAL_EMBEDDING_CACHE_LIMIT);
+        }
         entries.push({
           ...reference,
           filePath: outputPath,
+          cacheKey: maskKey,
           view: 'masked-visible',
           tileId: tile.id,
           visibleVariantKey: visibleVariant.key,
@@ -230,18 +301,26 @@ async function prepareClassifier(options = {}) {
     catalog,
     references,
     extractor,
+    partialReferenceEmbeddings: new Map(),
+    partialReferenceFiles: new Map(),
+    tileEmbeddings: new Map(),
     referencePrototypes: references.entries.map((entry, index) => ({
       label: entry.label,
       variant: entry.variant || null,
       file: entry.file,
+      filePath: entry.filePath,
       prototype: referenceEmbeddings[index],
     })),
   };
 }
 
-async function classifyPacketWithResources(packetDir, resources) {
+async function classifyPacketWithResources(packetDir, resources, timing = null, options = {}) {
+  const classifyStartedAt = performance.now();
+  const manifestReadStartedAt = performance.now();
   const manifest = JSON.parse(await fs.readFile(path.join(packetDir, 'manifest.json'), 'utf8'));
-  const tiles = manifest.tiles || [];
+  recordTiming(timing, 'fileReadMs', manifestReadStartedAt);
+  const tiles = (manifest.tiles || []).filter(tile =>
+    options.classifyHidden !== false || tile.role !== 'hidden');
   const {
     model,
     threshold,
@@ -251,10 +330,12 @@ async function classifyPacketWithResources(packetDir, resources) {
     referencePrototypes,
   } = resources;
   if (!tiles.length) {
-    return { model, threshold, libraryDir, referenceCount: references.entries.length, predictions: [], groups: [] };
+    recordTiming(timing, 'totalMs', classifyStartedAt);
+    return { model, threshold, libraryDir, referenceCount: references.entries.length, predictions: [], groups: [], timing };
   }
 
   if (!extractor || !referencePrototypes.length) {
+    recordTiming(timing, 'totalMs', classifyStartedAt);
     return {
       model,
       threshold,
@@ -272,22 +353,8 @@ async function classifyPacketWithResources(packetDir, resources) {
         alternatives: [],
       })),
       groups: [],
+      timing,
     };
-  }
-
-  const started = Date.now();
-  const hiddenTiles = tiles.filter(tile => tile.role === 'hidden');
-  const partialReferences = await buildPartialReferencePaths(packetDir, hiddenTiles, references.entries);
-  const partialReferenceEntries = partialReferences.entries;
-  const partialReferenceEmbeddings = partialReferenceEntries.length
-    ? await embedPaths(extractor, partialReferenceEntries.map(entry => entry.filePath))
-    : [];
-  const partialReferenceByVariant = new Map();
-  for (let index = 0; index < partialReferenceEntries.length; index++) {
-    const entry = partialReferenceEntries[index];
-    const key = `${entry.tileId}::${entry.visibleVariantKey}`;
-    if (!partialReferenceByVariant.has(key)) partialReferenceByVariant.set(key, []);
-    partialReferenceByVariant.get(key).push({ ...entry, prototype: partialReferenceEmbeddings[index] });
   }
 
   const tileInputs = [];
@@ -308,7 +375,119 @@ async function classifyPacketWithResources(packetDir, resources) {
       });
     }
   }
-  const tileEmbeddings = await embedPaths(extractor, tileInputs.map(input => input.filePath));
+  const tileEmbeddingStartedAt = performance.now();
+  const tileEmbeddings = new Array(tileInputs.length);
+  const uncachedTileInputs = [];
+  const uncachedTileByKey = new Map();
+  for (let index = 0; index < tileInputs.length; index++) {
+    const input = tileInputs[index];
+    const fingerprint = await fileFingerprint(input.filePath);
+    // The key is content-addressed. A revealed card, a changed mask, or a
+    // changed crop therefore cannot inherit an embedding from its old layer.
+    const cacheKey = `${input.tile.role}|${fingerprint}`;
+    const cached = cacheGet(resources.tileEmbeddings, cacheKey);
+    if (cached) {
+      tileEmbeddings[index] = cached;
+      if (timing) timing.tileEmbeddingCacheHits = (timing.tileEmbeddingCacheHits || 0) + 1;
+      continue;
+    }
+    let pending = uncachedTileByKey.get(cacheKey);
+    if (!pending) {
+      pending = { cacheKey, filePath: input.filePath, indexes: [] };
+      uncachedTileByKey.set(cacheKey, pending);
+      uncachedTileInputs.push(pending);
+    }
+    pending.indexes.push(index);
+  }
+  const uncachedTileEmbeddings = uncachedTileInputs.length
+    ? await embedPaths(extractor, uncachedTileInputs.map(input => input.filePath))
+    : [];
+  for (let index = 0; index < uncachedTileInputs.length; index++) {
+    const input = uncachedTileInputs[index];
+    const embedding = uncachedTileEmbeddings[index];
+    cacheSet(resources.tileEmbeddings, input.cacheKey, embedding, TILE_EMBEDDING_CACHE_LIMIT);
+    for (const tileIndex of input.indexes) tileEmbeddings[tileIndex] = embedding;
+  }
+  if (timing) timing.tileEmbeddingCacheMisses = uncachedTileInputs.length;
+  recordTiming(timing, 'tileEmbeddingMs', tileEmbeddingStartedAt);
+
+  // Use the full, immutable reference prototypes to select a bounded set of
+  // likely labels before creating masked references. Every hidden tile still
+  // gets a full-reference decision; masking is only narrowed to the candidates
+  // that could change that decision, which removes the large redundant batch
+  // without caching any board state or label.
+  const allowedPartialReferences = new Map();
+  for (let index = 0; index < tileInputs.length; index++) {
+    const input = tileInputs[index];
+    if (input.tile.role !== 'hidden' || !input.visibleVariantKey || !input.selectedCover) continue;
+    const rankedReferences = referencePrototypes
+      .map(reference => ({ reference, confidence: cosine(tileEmbeddings[index], reference.prototype) }))
+      .sort((a, b) => b.confidence - a.confidence);
+    // Keep one masked prototype for every library label so narrowing never
+    // removes a class. Add the strongest extra variants for visual robustness.
+    const selectedReferences = new Map();
+    for (const item of rankedReferences) {
+      if (!selectedReferences.has(item.reference.label)) {
+        selectedReferences.set(referenceKey(item.reference), item.reference);
+      }
+    }
+    for (const item of rankedReferences.slice(0, PARTIAL_REFERENCE_CANDIDATE_LIMIT)) {
+      selectedReferences.set(referenceKey(item.reference), item.reference);
+    }
+    allowedPartialReferences.set(
+      `${input.tile.id}::${input.visibleVariantKey}`,
+      new Set(selectedReferences.keys()),
+    );
+  }
+
+  const hiddenTiles = tiles.filter(tile => tile.role === 'hidden');
+  const partialReferences = await buildPartialReferencePaths(
+    packetDir,
+    hiddenTiles,
+    references.entries,
+    timing,
+    resources.partialReferenceFiles,
+    allowedPartialReferences,
+  );
+  const partialReferenceEntries = partialReferences.entries;
+  const referenceEmbeddingStartedAt = performance.now();
+  const partialReferenceEmbeddings = new Array(partialReferenceEntries.length);
+  const uncachedEntries = [];
+  const uncachedIndexes = [];
+  for (let index = 0; index < partialReferenceEntries.length; index++) {
+    const entry = partialReferenceEntries[index];
+    const cached = entry.cacheKey && cacheGet(resources.partialReferenceEmbeddings, entry.cacheKey);
+    if (cached) {
+      partialReferenceEmbeddings[index] = cached;
+      if (timing) timing.partialEmbeddingCacheHits = (timing.partialEmbeddingCacheHits || 0) + 1;
+    } else {
+      uncachedEntries.push(entry);
+      uncachedIndexes.push(index);
+    }
+  }
+  const uncachedReferenceEmbeddings = uncachedEntries.length
+    ? await embedPaths(extractor, uncachedEntries.map(entry => entry.filePath))
+    : [];
+  for (let index = 0; index < uncachedEntries.length; index++) {
+    const entry = uncachedEntries[index];
+    const embedding = uncachedReferenceEmbeddings[index];
+    partialReferenceEmbeddings[uncachedIndexes[index]] = embedding;
+    if (entry.cacheKey) cacheSet(
+      resources.partialReferenceEmbeddings,
+      entry.cacheKey,
+      embedding,
+      PARTIAL_EMBEDDING_CACHE_LIMIT,
+    );
+  }
+  recordTiming(timing, 'referenceEmbeddingMs', referenceEmbeddingStartedAt);
+  const partialReferenceByVariant = new Map();
+  for (let index = 0; index < partialReferenceEntries.length; index++) {
+    const entry = partialReferenceEntries[index];
+    const key = `${entry.tileId}::${entry.visibleVariantKey}`;
+    if (!partialReferenceByVariant.has(key)) partialReferenceByVariant.set(key, []);
+    partialReferenceByVariant.get(key).push({ ...entry, prototype: partialReferenceEmbeddings[index] });
+  }
+
   const inputsByTile = new Map();
   for (let index = 0; index < tileInputs.length; index++) {
     const input = { ...tileInputs[index], embedding: tileEmbeddings[index] };
@@ -323,8 +502,11 @@ async function classifyPacketWithResources(packetDir, resources) {
       const partialEntriesForVariant = tile.role === 'hidden'
         ? partialReferenceByVariant.get(`${tile.id}::${option.visibleVariantKey}`) || []
         : [];
+      // Masked references add evidence for the visible fragment; they must
+      // never remove the complete-reference fallback. Keeping both sets
+      // preserves labels that were not among the bounded masked candidates.
       const candidateReferences = partialEntriesForVariant.length
-        ? partialEntriesForVariant
+        ? partialEntriesForVariant.concat(referencePrototypes)
         : referencePrototypes;
       for (const reference of candidateReferences) {
         const confidence = cosine(option.embedding, reference.prototype);
@@ -380,6 +562,7 @@ async function classifyPacketWithResources(packetDir, resources) {
       })),
     };
   });
+  const postprocessStartedAt = performance.now();
   const unknownItems = preliminary.filter(item => !item.best || item.best.confidence < threshold);
   const unknownTiles = unknownItems.map(item => item.tile);
   const unknownEmbeddings = unknownItems.map(item => item.embedding);
@@ -469,9 +652,14 @@ async function classifyPacketWithResources(packetDir, resources) {
     missingReferences: references.missing,
     referenceVariants: partialReferences.variantDir,
     tileCount: tiles.length,
-    inferenceMs: Date.now() - started,
+    inferenceMs: Math.round(performance.now() - classifyStartedAt),
     predictions,
     groups: namedGroups.concat(unknownGroups.groups),
+    timing: {
+      ...(timing || {}),
+      postprocessMs: Number((performance.now() - postprocessStartedAt).toFixed(3)),
+      totalMs: Number((performance.now() - classifyStartedAt).toFixed(3)),
+    },
   };
 }
 
@@ -488,7 +676,7 @@ async function createClassifier(options = {}) {
     libraryDir: resources.libraryDir,
     referenceCount: resources.references.entries.length,
     missingReferences: resources.references.missing,
-    classifyPacket: packetDir => classifyPacketWithResources(packetDir, resources),
+    classifyPacket: (packetDir, timing, options) => classifyPacketWithResources(packetDir, resources, timing, options),
   };
 }
 

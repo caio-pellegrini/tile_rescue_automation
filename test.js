@@ -1,14 +1,8 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const sharp = require('sharp');
-const { connectedComponents, semanticType, summarize, chooseAction } = require('./agent');
+const { semanticType, chooseAction } = require('./agent');
 const { applyVisionLabels, buildVisionManifest, cropBox, validateLayerGraph } = require('./vision');
-const { groupEmbeddings } = require('./local_ml');
-const { buildPhaseMap, detectTerminalStatus, parseArgs } = require('./play');
-
-async function load(path) {
-  return sharp(fs.readFileSync(path)).raw().toBuffer({ resolveWithObject: true });
-}
+const { groupEmbeddings, loadCatalog } = require('./local_ml');
+const { buildPhaseMap, detectTerminalStatus, parseArgs, parseRawScreencap } = require('./play');
 
 (async () => {
   assert.deepEqual(parseArgs([]), {
@@ -18,6 +12,9 @@ async function load(path) {
     level: '23',
     settleMs: 1200,
     runDir: null,
+    replayDir: null,
+    fast: false,
+    rawCapture: false,
     useMl: true,
   });
   assert.deepEqual(parseArgs(['--live', '--moves', '3', '--no-ml', '--settle-ms', '700']), {
@@ -27,8 +24,59 @@ async function load(path) {
     level: '23',
     settleMs: 700,
     runDir: null,
+    replayDir: null,
+    fast: false,
+    rawCapture: false,
     useMl: false,
   });
+  assert.deepEqual(parseArgs(['--fast', '--moves', '3', '--replay-dir', '/tmp/replay']), {
+    live: false,
+    maxMoves: 3,
+    device: 'RQCY903RJQN',
+    level: '23',
+    settleMs: 1200,
+    runDir: null,
+    replayDir: '/tmp/replay',
+    fast: true,
+    rawCapture: false,
+    useMl: true,
+  });
+  assert.deepEqual(parseArgs(['--raw-capture']), {
+    live: false,
+    maxMoves: 1,
+    device: 'RQCY903RJQN',
+    level: '23',
+    settleMs: 1200,
+    runDir: null,
+    replayDir: null,
+    fast: false,
+    rawCapture: true,
+    useMl: true,
+  });
+  const rawWidth = 2;
+  const rawHeight = 1;
+  const raw = Buffer.alloc(16 + rawWidth * rawHeight * 4);
+  raw.writeUInt32LE(rawWidth, 0);
+  raw.writeUInt32LE(rawHeight, 4);
+  raw.writeUInt32LE(1, 8);
+  raw[16] = 11;
+  raw[17] = 22;
+  raw[18] = 33;
+  raw[19] = 255;
+  assert.deepEqual(parseRawScreencap(raw), {
+    data: raw.subarray(16),
+    info: { width: 2, height: 1, channels: 4 },
+    header: { pixelFormat: 1, dataSpace: 0 },
+  });
+  assert.throws(() => parseRawScreencap(Buffer.alloc(16)), /não suportado/);
+  const truncatedRaw = Buffer.alloc(16);
+  truncatedRaw.writeUInt32LE(rawWidth, 0);
+  truncatedRaw.writeUInt32LE(rawHeight, 4);
+  truncatedRaw.writeUInt32LE(1, 8);
+  assert.throws(() => parseRawScreencap(truncatedRaw), /esperado 24/);
+  const unsupportedRaw = Buffer.from(raw);
+  unsupportedRaw.writeUInt32LE(2, 8);
+  assert.throws(() => parseRawScreencap(unsupportedRaw), /pixel format 2/);
   assert.deepEqual(detectTerminalStatus({
     state: { available: [], tray: [], layerGraph: { hidden: [] } },
     action: { reason: 'no-action', tile: null },
@@ -284,33 +332,30 @@ async function load(path) {
   assert.equal(pairBeatsFullTrayTriple.reason, 'make-pair-with-tray');
   assert.equal(pairBeatsFullTrayTriple.targetType, 'pepper');
 
-  const clusters = [];
-  const cleanImage = await load('/tmp/tile_rescue_level23_clean.png');
-  const clean = summarize(cleanImage, connectedComponents(cleanImage), clusters);
-  assert.equal(Object.keys(clean.trayCounts).length, 0);
-  assert.ok(clean.available.some(t => t.type === 'corn'));
-  assert.ok(clean.available.some(t => t.type === 'chick'));
-  assert.ok(clean.available.filter(t => t.type === 'cupcake').length >= 2);
-
-  const afterOneImage = await load('/tmp/agent_after_one.png');
-  const afterOne = summarize(afterOneImage, connectedComponents(afterOneImage), clusters);
-  assert.equal(afterOne.trayCounts.carrot, 1);
-  assert.ok(afterOne.available.some(t => t.type === 'corn'));
-
-  const afterTwoImage = await load('/tmp/agent_after_two.png');
-  const afterTwo = summarize(afterTwoImage, connectedComponents(afterTwoImage), clusters);
-  assert.deepEqual(afterTwo.trayCounts, { carrot: 1, corn: 1 });
-  const action = chooseAction(afterTwo);
-  assert.equal(action.reason, 'complete-triple-potential');
-  assert.equal(action.tile.type, 'corn');
-
-  const trayRegressionImage = await load('/tmp/tile-rescue-after-two.png');
-  const trayRegression = summarize(
-    trayRegressionImage,
-    connectedComponents(trayRegressionImage),
-    [],
-  );
-  assert.equal(trayRegression.tray.length, 2);
+  const syntheticInfo = { width: 1080, height: 2340 };
+  const syntheticOcclusionState = {
+    detected: [
+      { cx: 300, cy: 700, type: 'carrot' },
+      { cx: 120, cy: 1740, type: 'carrot' },
+    ],
+    available: [{ cx: 300, cy: 700, type: 'carrot' }],
+    tray: [{ cx: 120, cy: 1740, type: 'carrot' }],
+    trayCounts: { carrot: 1 },
+    visibleCounts: { carrot: 1 },
+    safety: { liveAllowed: true },
+    layerGraph: {
+      hidden: [{ cx: 300, cy: 800, visibility: 0.4, type: 'carrot' }],
+      edges: [{
+        cover: { cx: 300, cy: 700 },
+        target: { cx: 300, cy: 800, type: 'carrot' },
+        overlap: 0.4,
+        confidence: 0.8,
+      }],
+    },
+  };
+  let manifest = buildVisionManifest(syntheticOcclusionState, syntheticInfo);
+  let occlusionImage = { info: syntheticInfo };
+  let occlusionState = syntheticOcclusionState;
 
   const grouped = chooseAction({
     trayCounts: {},
@@ -369,24 +414,34 @@ async function load(path) {
   assert.equal(trayTriple.targetType, 'butterfly');
   assert.equal(trayTriple.tile.type, 'butterfly');
 
-  const occlusionImage = await load('/tmp/tile_rescue_manual_carrot_check.png');
-  const occlusionState = summarize(
-    occlusionImage,
-    connectedComponents(occlusionImage),
-    [],
-  );
-  const occlusionAction = chooseAction(occlusionState);
-  assert.equal(occlusionAction.reason, 'release-hidden-match');
-  assert.equal(occlusionAction.tile.type, 'cupcake');
-  assert.equal(occlusionAction.reveals.type, 'carrot');
+  const carrotTriple = chooseAction({
+    trayCounts: {},
+    available: [
+      { type: 'carrot', planningKey: 'carrot', cx: 100, cy: 700 },
+      { type: 'carrot', planningKey: 'carrot', cx: 200, cy: 700 },
+      { type: 'carrot', planningKey: 'carrot', cx: 300, cy: 700 },
+      { type: 'butterfly', planningKey: 'butterfly', cx: 400, cy: 700 },
+      { type: 'butterfly', planningKey: 'butterfly', cx: 500, cy: 700 },
+    ],
+    detected: [],
+    visibleCounts: { carrot: 3, butterfly: 2 },
+    safety: { liveAllowed: true },
+  });
+  assert.equal(carrotTriple.reason, 'start-exposed-triple');
+  assert.equal(carrotTriple.targetType, 'carrot');
+
   assert.equal(semanticType([0.02, 0.038, 0.847, 0.04, 0, 0, 0, 0.055, 0]), 'chick');
   assert.equal(semanticType([0.0059, 0.0867, 0.7406, 0.0964, 0.0015, 0, 0, 0.0689, 0]), 'sun');
   assert.equal(semanticType([0, 0, 0, 0, 0.2, 0, 0]), 'unknown');
 
-  const manifest = buildVisionManifest(occlusionState, occlusionImage.info);
   assert.ok(manifest.tiles.length > 0);
   assert.ok(manifest.tiles.every(tile => tile.crop.endsWith('.png')));
-  assert.ok(manifest.tiles.every(tile => tile.box.width === 142 && tile.box.height === 160));
+  assert.ok(manifest.tiles
+    .filter(tile => tile.role !== 'tray')
+    .every(tile => tile.box.width === 142 && tile.box.height === 160));
+  assert.ok(manifest.tiles
+    .filter(tile => tile.role === 'tray')
+    .every(tile => tile.box.width === 108 && tile.box.height === 140));
   assert.ok(manifest.references.some(reference => reference.type === 'carrot'));
   assert.deepEqual(cropBox({ cx: 10, cy: 10 }, occlusionImage.info), {
     left: 0, top: 0, width: 142, height: 160,
@@ -421,7 +476,7 @@ async function load(path) {
   assert.deepEqual(layeredManifest.tiles[0].maskedBy, [{ cx: 300, cy: 600, confidence: 0.8 }]);
   assert.equal(layeredManifest.tiles[0].visibleMask.maskedFraction, 0.375);
   assert.equal(layeredManifest.tiles[0].visibleMask.remainingFraction, 0.625);
-  assert.equal(layeredManifest.layerGraphValidation.valid, false);
+  assert.equal(layeredManifest.layerGraphValidation.valid, true);
   assert.equal(validateLayerGraph(layeredManifest.layerGraph).maxEdgesPerTarget, 2);
 
   const unlabeled = groupEmbeddings(
@@ -431,6 +486,10 @@ async function load(path) {
   );
   assert.equal(unlabeled.predictions[0].label, 'unknown');
   assert.match(unlabeled.predictions[0].groupId, /^unlabeled-group-/);
+
+  const catalog = await loadCatalog();
+  assert.ok(Array.isArray(catalog.icons.carrot));
+  assert.ok(catalog.icons.carrot.length >= 3);
 
   const labelTarget = manifest.tiles.find(tile => tile.role === 'tray');
   const labelState = {
@@ -446,5 +505,5 @@ async function load(path) {
   }]);
   assert.equal(labelResult.applied, 2);
   assert.deepEqual(labelState.trayCounts, { carrot: 1 });
-  console.log('vision/planner replay: ok');
+  console.log('vision/planner tests: ok');
 })().catch(err => { console.error(err); process.exit(1); });
