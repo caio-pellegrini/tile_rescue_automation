@@ -1,6 +1,22 @@
-# Tile Rescue automation
+# Tile Rescue Automation
 
-Agente local para o Tile Rescue via ADB. Ele captura a tela, detecta as peças expostas e os slots da bandeja, agrupa os ícones por assinatura visual e escolhe uma ação conservadora.
+**A local vision-and-decision agent that observes an Android puzzle game through ADB and chooses conservative moves without relying on a remote vision service.**
+
+I built this project as an experiment in turning raw screen observations into auditable actions. The agent captures the device screen, detects exposed tiles and tray slots, classifies visual icons with a local embedding pipeline, reasons about matches and occlusion, and can execute a selected move through ADB.
+
+### Engineering highlights
+
+- End-to-end **observe → classify → reason → act → verify** loop.
+- Local batched visual embeddings with a reusable named-reference library.
+- Geometry and experimental occlusion graph for partially hidden tiles.
+- Conservative decision policy that protects the final tray slot and prefers completing triples.
+- Dry-run by default, with explicit live mode and move limits.
+- Replayable runs with screenshots, predictions, state, decisions, overlays, and timing artifacts for debugging.
+- No coins, ads, boosters, or paid-game mechanics are used by the automation.
+
+The project is intentionally built around inspectability: uncertain icons remain `unknown`, actions can be replayed from captured states, and the agent keeps evidence for each decision instead of hiding the vision pipeline behind a black box.
+
+> Detailed implementation notes below are in Portuguese.
 
 ## Uso
 
